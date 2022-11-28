@@ -11,7 +11,7 @@ repos:
     hooks:
       - id: absolufy-imports
   - repo: 'https://github.com/pre-commit/pre-commit-hooks'
-    rev: v4.3.0
+    rev: v4.4.0
     hooks:
       - id: check-added-large-files
       - id: check-toml
@@ -22,14 +22,14 @@ repos:
       - id: pretty-format-json
       - id: trailing-whitespace
   - repo: 'https://github.com/asottile/pyupgrade'
-    rev: v2.37.2
+    rev: v3.2.2
     hooks:
       - id: pyupgrade
         args:
           - '--py38-plus'
           - '--keep-runtime-typing'
   - repo: 'https://github.com/myint/autoflake'
-    rev: v1.4
+    rev: v2.0.0
     hooks:
       - id: autoflake
         args:
@@ -56,7 +56,7 @@ repos:
         types:
           - pyi
   - repo: 'https://github.com/psf/black'
-    rev: 22.6.0
+    rev: 22.10.0
     hooks:
       - id: black
         args:
@@ -72,11 +72,11 @@ repos:
         additional_dependencies:
           - black==22.3.0
   - repo: 'https://github.com/asottile/yesqa'
-    rev: v1.3.0
+    rev: v1.4.0
     hooks:
       - id: yesqa
   - repo: 'https://github.com/executablebooks/mdformat'
-    rev: 0.7.14
+    rev: 0.7.16
     hooks:
       - id: mdformat
         additional_dependencies:
@@ -84,7 +84,7 @@ repos:
           - mdformat_frontmatter
         exclude: CHANGELOG.md
   - repo: https://github.com/nbQA-dev/nbQA
-    rev: 1.4.0
+    rev: 1.5.3
     hooks:
     - id: nbqa-black
       name: nbqa-black

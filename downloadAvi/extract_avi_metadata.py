@@ -267,7 +267,6 @@ def makeVideo(fileToProcess, destinationFolder, datatype="ANGIO"):
                 print("Creating ", destinationFolder)
                 os.makedirs(destinationFolder)
 
-
             video_filename = os.path.join(destinationFolder, fileName + ".avi")
             # Requires for TTE:
             # finaloutput = dicom.pixel_data_handlers.convert_color_space(testarray,'YBR_FULL', 'RGB')
