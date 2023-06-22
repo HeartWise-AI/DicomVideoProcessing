@@ -30,14 +30,14 @@ repos:
       - id: pretty-format-json
       - id: trailing-whitespace
   - repo: 'https://github.com/asottile/pyupgrade'
-    rev: v3.2.2
+    rev: v3.7.0
     hooks:
       - id: pyupgrade
         args:
           - '--py38-plus'
           - '--keep-runtime-typing'
   - repo: 'https://github.com/myint/autoflake'
-    rev: v2.0.0
+    rev: v2.1.1
     hooks:
       - id: autoflake
         args:
@@ -48,7 +48,7 @@ repos:
           - __init__.py
           - '--remove-duplicate-keys'
   - repo: 'https://github.com/pycqa/isort'
-    rev: 5.10.1
+    rev: 5.12.0
     hooks:
       - id: isort
         args:
@@ -64,7 +64,7 @@ repos:
         types:
           - pyi
   - repo: 'https://github.com/psf/black'
-    rev: 22.10.0
+    rev: 23.3.0
     hooks:
       - id: black
         args:
@@ -72,7 +72,7 @@ repos:
           - '--exclude'
           - __init__.py
   - repo: 'https://github.com/asottile/blacken-docs'
-    rev: v1.12.1
+    rev: 1.14.0
     hooks:
       - id: blacken-docs
         args:
@@ -80,7 +80,7 @@ repos:
         additional_dependencies:
           - black==22.3.0
   - repo: 'https://github.com/asottile/yesqa'
-    rev: v1.4.0
+    rev: v1.5.0
     hooks:
       - id: yesqa
   - repo: 'https://github.com/executablebooks/mdformat'
@@ -92,7 +92,7 @@ repos:
           - mdformat_frontmatter
         exclude: CHANGELOG.md
   - repo: https://github.com/nbQA-dev/nbQA
-    rev: 1.5.3
+    rev: 1.7.0
     hooks:
     - id: nbqa-black
       name: nbqa-black

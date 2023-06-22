@@ -99,7 +99,7 @@ def dicom_dataset_to_dict(dicom_header, fileToProcess):
         (0x7FDF, 0x1086),  # R-Wave Timestamp
         (0x200D, 0x3000),  # Private Data Tag
         (0x200D, 0x300F),  # Private Data Tag
-        (0x200D, 0x5100)   # Private Data Tag
+        (0x200D, 0x5100),  # Private Data Tag
     ]
 
     for dicom_value in dicom_header.values():
@@ -108,7 +108,9 @@ def dicom_dataset_to_dict(dicom_header, fileToProcess):
                 continue
 
             if type(dicom_value.value) == dicom.dataset.Dataset:
-                dicom_dict[str(dicom_value.tag)] = dicom_dataset_to_dict(dicom_value.value, fileToProcess)
+                dicom_dict[str(dicom_value.tag)] = dicom_dataset_to_dict(
+                    dicom_value.value, fileToProcess
+                )
             else:
                 v = _convert_value(dicom_value.value)
                 if str(dicom_value.tag) in dicom_dict.keys():
@@ -119,7 +121,7 @@ def dicom_dataset_to_dict(dicom_header, fileToProcess):
                 else:
                     dicom_dict[str(dicom_value.tag)] = v
         except Exception as e:
-            print(f'Error processing tag {dicom_value.tag}: {str(e)}')
+            print(f"Error processing tag {dicom_value.tag}: {str(e)}")
             continue
     return dicom_dict
 
@@ -244,7 +246,7 @@ DICOM_DICT = {
         "(0018, 1114)": "estimated_radiographic_magnification_factor",
         "(0018, 1134)": "table_motion",
         "(0018, 1155)": "radiation_setting",
-        "(0018, 1164)": "image_pixel_spacing"        
+        "(0018, 1164)": "image_pixel_spacing",
     },
     "TTE": {
         "(0010, 0040)": "sex",
@@ -275,6 +277,7 @@ DICOM_DICT = {
         "video_path": "FileName",
     },
 }
+
 
 def process_metadata(metadata, data_type):
     tag_map = DICOM_DICT[data_type]
