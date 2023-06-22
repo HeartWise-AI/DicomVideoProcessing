@@ -12,6 +12,7 @@ oread/notebooks/wandb/
 final_models/
 dicom*/
 data*/
+deepIFR/
 DeepQCA_videos/
 CathEF-data/
 df_angle_object_rca_lca_filtered/

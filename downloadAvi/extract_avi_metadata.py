@@ -19,8 +19,6 @@ from pydicom.uid import UID, generate_uid
 from tqdm import tqdm
 
 sys.stdout = open(1, "w")
-
-
 # python StudyInstanceUIDvi_metadata.py --input_file='../CathAI/data/DeepCORO/CATHAI_Extracted_Concatenated/DeepCORO_df_angle_object_dicom_2020_concat.csv' --destinationFolder='data3/' --dataFolder='data/' --data_type='ANGIO'
 
 
@@ -84,111 +82,44 @@ def mask_and_crop(movie):
 
 
 # In[164]:
-
-
 def dicom_dataset_to_dict(dicom_header, fileToProcess):
     dicom_dict = {}
     dicom_dict["file"] = fileToProcess
     repr(dicom_header)
+
+    discard_tags = [
+        (0x7FE0, 0x0010),  # Pixel data
+        (0x7FDF, 0x1080),  # B-mode 1D Post Processing Curve
+        (0x7FDF, 0x1081),  # B-mode Delta (ECRI) Map Diagonal
+        (0x7FDF, 0x1085),  # Acoustic Frame Timestamp
+        (0x7FDF, 0x108D),  # ECG Data Value
+        (0x7FDF, 0x10F1),  # Trigger Mask
+        (0x7FDF, 0xFE00),  # Data Padding
+        (0x7FDF, 0x1089),  # ECG Reference Timestamp
+        (0x7FDF, 0x1086),  # R-Wave Timestamp
+        (0x200D, 0x3000),  # Private Data Tag
+        (0x200D, 0x300F),  # Private Data Tag
+        (0x200D, 0x5100)   # Private Data Tag
+    ]
+
     for dicom_value in dicom_header.values():
         try:
-            if dicom_value.tag == (0x7FE0, 0x0010):
-                # discard pixel data
+            if dicom_value.tag in discard_tags:
                 continue
-            if dicom_value.tag == (0x7FDF, 0x1080):
-                # discard [B-mode 1D Post Processing Curve]
-                continue
-            if dicom_value.tag == (0x7FDF, 0x1081):
-                # discard [B-mode Delta (ECRI) Map Diagonal]
-                continue
-            if dicom_value.tag == (0x7FDF, 0x1085):
-                # discard [Acoustic Frame Timestamp]
-                continue
-            if dicom_value.tag == (0x7FDF, 0x108D):
-                # discard [ECG Data Value]
-                continue
-            if dicom_value.tag == (0x7FDF, 0x10F1):
-                # discard [Trigger Mask.]
-                continue
-            if dicom_value.tag == (0x7FDF, 0xFE00):
-                # discard [Data Padding]
-                continue
-            if dicom_value.tag == (0x7FDF, 0x1089):
-                # discard [ECG Reference Timestamp]
-                continue
-            if dicom_value.tag == (0x7FDF, 0x1086):
-                # discard [R-Wave Timestamp]
-                continue
-            if dicom_value.tag == (0x200D, 0x3000):
-                # discard Private Data Tag
-                continue
-            if dicom_value.tag == (0x200D, 0x300F):
-                # discard Private Data Tag
-                continue
-            if dicom_value.tag == (0x200D, 0x5100):
-                # discard Private Data Tag
-                continue
-            #         if dicom_value.tag == (0x7fdf, 0x1086):
-            #             # discard [R-Wave Timestamp]
-            #             continue
+
             if type(dicom_value.value) == dicom.dataset.Dataset:
-                dicom_dict[str(dicom_value.tag)] = dicom_dataset_to_dict(dicom_value.value)
+                dicom_dict[str(dicom_value.tag)] = dicom_dataset_to_dict(dicom_value.value, fileToProcess)
             else:
-                if dicom_value.tag == (0x18, 0x6011):
-                    for i in range(int(str(dicom_value)[-2])):
-                        for dicom_value_2 in dicom_value[i]:
-                            v = _convert_value(dicom_value_2.value)
-                            if int(str(dicom_value)[-2]) > 1:
-                                if str(dicom_value_2.tag) in dicom_dict.keys():
-                                    try:
-                                        dicom_dict.setdefault(str(dicom_value_2.tag), []).append(
-                                            v
-                                        )
-                                    except:
-                                        (dicom_dict.setdefault(str(dicom_value_2.tag), []) + v)
-                                else:
-                                    dicom_dict[str(dicom_value_2.tag)] = [v]
-                            else:
-                                dicom_dict[str(dicom_value_2.tag)] = v
-                elif dicom_value.tag == (0x32, 0x1064):
-                    for dicom_value_4 in dicom_value[0]:
-                        v = _convert_value(dicom_value_4.value)
-                        dicom_dict[str(dicom_value_4.tag)] = v
-                elif dicom_value.tag == (0x8, 0x2112):
-                    for dicom_value_5 in dicom_value[0]:
-                        v = _convert_value(dicom_value_5.value)
-                        dicom_dict[str(dicom_value_5.tag)] = v
-                elif dicom_value.tag == (0x10, 0x1002):
-                    for dicom_value_6 in dicom_value[0]:
-                        v = _convert_value(dicom_value_6.value)
-                        dicom_dict[str(dicom_value_6.tag)] = v
-                elif dicom_value.tag == (0x40, 0x0275):
-                    for dicom_value_3 in dicom_value[0]:
-                        v = _convert_value(dicom_value_3.value)
-                        dicom_dict[str(dicom_value_3.tag)] = v
-                elif dicom_value.tag == (0x0032, 0x1064):
-                    for dicom_value_7 in dicom_value[0]:
-                        v = _convert_value(dicom_value_7.value)
-                        dicom_dict[str(dicom_value_7.tag)] = v
-                elif dicom_value.tag == (0x0040, 0x0008):
-                    for dicom_value_9 in dicom_value[0]:
-                        v = _convert_value(dicom_value_9.value)
-                        dicom_dict[str(dicom_value_9.tag)] = v
-                elif dicom_value.tag == (0x0040, 0x0260):
-                    for dicom_value_10 in dicom_value[0]:
-                        v = _convert_value(dicom_value_10.value)
-                        dicom_dict[str(dicom_value_10.tag)] = v
+                v = _convert_value(dicom_value.value)
+                if str(dicom_value.tag) in dicom_dict.keys():
+                    try:
+                        dicom_dict.setdefault(str(dicom_value.tag), []).append(v)
+                    except:
+                        dicom_dict.setdefault(str(dicom_value.tag), []) + v
                 else:
-                    v = _convert_value(dicom_value.value)
-                    # append if value is there, if not set key
-                    if str(dicom_value.tag) in dicom_dict.keys():
-                        try:
-                            dicom_dict.setdefault(str(dicom_value.tag), []).append(v)
-                        except:
-                            dicom_dict.setdefault(str(dicom_value.tag), []) + v
-                    else:
-                        dicom_dict[str(dicom_value.tag)] = v
-        except:
+                    dicom_dict[str(dicom_value.tag)] = v
+        except Exception as e:
+            print(f'Error processing tag {dicom_value.tag}: {str(e)}')
             continue
     return dicom_dict
 
@@ -230,9 +161,6 @@ def makeVideo(fileToProcess, destinationFolder, datatype="ANGIO"):
         try:
             testarray = dataset.pixel_array
             testarray = np.stack((testarray,) * 3, axis=-1)
-
-            fps = 30
-
             if datatype == "ANGIO":
                 fps = 15
                 try:
@@ -289,128 +217,91 @@ def makeVideo(fileToProcess, destinationFolder, datatype="ANGIO"):
     return 0
 
 
-# In[156]:
-
+DICOM_DICT = {
+    "ANGIO": {
+        "(0008, 0070)": "brand",
+        "(0010, 0040)": "sex",
+        "(0008, 2144)": "FPS",
+        "(0028, 0008)": "NumberOfFrames",
+        "(0008, 0020)": "date",
+        "(0008, 0030)": "study_time",
+        "(0008, 0031)": "series_time",
+        "(0010, 0030)": "birthdate",
+        "(0028, 0004)": "color_format",
+        "(0010, 0020)": "mrn",
+        "(0008, 0018)": "StudyID",
+        "(0020, 000d)": "StudyInstanceUID",
+        "(0020, 000e)": "SeriesInstanceUID",
+        "file": "dicom_path",
+        "video_path": "FileName",
+        "(0018, 1510)": "primary_angle",
+        "(0018, 1511)": "secondary_angle",
+        "(0028, 0010)": "width",
+        "(0028, 0011)": "height",
+        "(0028, 0030)": "pixel_spacing",
+        "(0018, 1110)": "distance_source_to_detector",
+        "(0018, 1111)": "distance_source_to_patient",
+        "(0018, 1114)": "estimated_radiographic_magnification_factor",
+        "(0018, 1134)": "table_motion",
+        "(0018, 1155)": "radiation_setting",
+        "(0018, 1164)": "image_pixel_spacing"        
+    },
+    "TTE": {
+        "(0010, 0040)": "sex",
+        "(0018, 1063)": "FPS",
+        "(0018, 0040)": "fps_2",
+        "(7fdf, 1074)": "fps_3",
+        "(0028, 0008)": "NumberOfFrames",
+        "(0018, 602c)": "physical_delta_x",
+        "(0018, 602e)": "physical_delta_y",
+        "(0018, 1088)": "hr_bpm",
+        "(0008, 0070)": "brand",
+        "(0008, 0020)": "date",
+        "(0008, 0030)": "time",
+        "(0008, 1090)": "model",
+        "(0008, 1030)": "study_type",
+        "(0008, 1060)": "physician_reader",
+        "(0010, 0030)": "birthdate",
+        "(0010, 1030)": "patient_weight_kg",
+        "(0010, 1020)": "patient_height_m",
+        "(0010, 21b0)": "patient_history",
+        "(0010, 4000)": "patient_comments",
+        "(0028, 0004)": "color_format",
+        "(0010, 0020)": "mrn",
+        "(0008, 0018)": "StudyID",
+        "(0020, 000d)": "StudyInstanceUID",
+        "(0020, 000e)": "SeriesInstanceUID",
+        "file": "dicom_path",
+        "video_path": "FileName",
+    },
+}
 
 def process_metadata(metadata, data_type):
-    if data_type == "ANGIO":
-        metadata = metadata[
-            [
-                "(0008, 0070)",
-                "(0010, 0040)",
-                "(0008, 2144)",
-                "(0028, 0008)",
-                "(0008, 0020)",
-                "(0008, 0030)",
-                "(0008, 0031)",
-                "(0010, 0030)",
-                "(0028, 0004)",
-                "(0010, 0020)",
-                "(0008, 0018)",
-                "(0020, 000d)",
-                "(0020, 000e)",
-                "file",
-                "video_path",
-            ]
-        ]
+    tag_map = DICOM_DICT[data_type]
 
-        metadata.columns = [
-            "brand",
-            "sex",
-            "FPS",
-            "NumberOfFrames",
-            "date",
-            "study_time",
-            "series_time",
-            "birthdate",
-            "color_format",
-            "mrn",
-            "StudyID",
-            "StudyInstanceUID",
-            "SeriesInstanceUID",
-            "dicom_path",
-            "FileName",
-        ]
+    # Make sure all expected columns exist in the DataFrame
+    for tag, col_name in tag_map.items():
+        if tag not in metadata.columns:
+            metadata[tag] = np.nan
 
-    elif data_type == "TTE":
-        metadata = metadata[
-            [
-                "(0010, 0040)",
-                "(0018, 1063)",
-                "(0018, 0040)",
-                "(7fdf, 1074)",
-                "(0028, 0008)",
-                "(0018, 602c)",
-                "(0018, 602e)",
-                "(0018, 1088)",
-                "(0008, 0070)",
-                "(0008, 0020)",
-                "(0008, 0030)",
-                "(0008, 1090)",
-                "(0008, 1030)",
-                "(0008, 1060)",
-                "(0010, 0030)",
-                "(0010, 1030)",
-                "(0010, 1020)",
-                "(0010, 21b0)",
-                "(0010, 4000)",
-                "(0028, 0004)",
-                "(0010, 0020)",
-                "(0008, 0018)",
-                "(0020, 000d)",
-                "(0020, 000e)",
-                "file",
-                "video_path",
-            ]
-        ]
+    # Select only the columns of interest
+    metadata = metadata[list(tag_map.keys())]
 
-        metadata.columns = [
-            "sex",
-            "FPS",
-            "fps_2",
-            "fps_3",
-            "NumberOfFrames",
-            "physical_delta_x",
-            "physical_delta_y",
-            "hr_bpm",
-            "brand",
-            "date",
-            "time",
-            "model",
-            "study_type",
-            "physician_reader",
-            "birthdate",
-            "patient_weight_kg",
-            "patient_height_m",
-            "patient_history",
-            "patient_comments",
-            "color_format",
-            "mrn",
-            "StudyID",
-            "StudyInstanceUID",
-            "SeriesInstanceUID",
-            "dicom_path",
-            "FileName",
-        ]
-        metadata["FPS"] = metadata["FPS"].fillna(metadata["fps_3"])
-    try:
-        metadata["FPS"] = metadata["FPS"].fillna(metadata["fps_2"])
-        metadata["FPS"] = metadata["FPS"].fillna(15.0)
-    except:
-        metadata["FPS"] = metadata["FPS"].fillna(15.0)
+    # Rename the columns
+    metadata.columns = list(tag_map.values())
 
-    try:
-        metadata = metadata.drop(columns=["fps_2", "fps_3"])
-    except:
-        try:
-            metadata = metadata.drop(columns=["fps_2"])
-        except:
-            print("No fps_2 column")
+    # Fill in the default FPS if not provided
+    fps_col_names = ["FPS", "fps_2", "fps_3"]
+    fps_col_names = [name for name in fps_col_names if name in metadata.columns]
+    if fps_col_names:
+        metadata["FPS"] = metadata[fps_col_names].bfill(axis=1).iloc[:, 0]
+        metadata = metadata.drop(columns=fps_col_names[1:])
+    else:
+        metadata["FPS"] = 1.0  # default value if no FPS information is present
+
     metadata["StudyInstanceUID"] = metadata["StudyInstanceUID"].str.replace("'", "")
+
     return metadata
-
-
-# In[177]:
 
 
 def extract_avi_and_metadata(
@@ -442,7 +333,9 @@ def extract_avi_and_metadata(
                 final_list.append(dicom_metadata)
         else:
             print("Already did this file", VideoPath)
+
     dicom_df_final = pd.DataFrame(final_list)
+
     dicom_df_final = process_metadata(dicom_df_final, data_type)
     dicom_df_final["Split"] = "inference"
     fileName_1 = path.split("/")[-1]
