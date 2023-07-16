@@ -188,6 +188,7 @@ def makeVideo(fileToProcess, destinationFolder, datatype="ANGIO"):
                         try:
                             fps = dataset[(0x7FDF, 0x1074)].value
                         except:
+                            fps = 30
                             print("couldn't find frame rate, default to 30")
 
             fourcc = cv2.VideoWriter_fourcc("M", "J", "P", "G")
@@ -198,6 +199,7 @@ def makeVideo(fileToProcess, destinationFolder, datatype="ANGIO"):
                 os.makedirs(destinationFolder)
 
             video_filename = os.path.join(destinationFolder, fileName + ".avi")
+
             # Requires for TTE:
             # finaloutput = dicom.pixel_data_handlers.convert_color_space(testarray,'YBR_FULL', 'RGB')
             # finaloutput = mask_and_crop(testarray)
@@ -209,13 +211,16 @@ def makeVideo(fileToProcess, destinationFolder, datatype="ANGIO"):
                 dicom_dict = dicom_dataset_to_dict(dataset, fileToProcess)
                 dicom_dict["video_path"] = video_filename
                 return dicom_dict
-            except:
-                print("error", fileToProcess)
-        except:
-            print("Error in pixel data", fileToProcess)
+            except Exception as e:  # Catch the exception into a variable e
+                print(
+                    f"Error while writing video for file: {fileToProcess}. Error details: {str(e)}"
+                )
+        except Exception as e:  # Catch the exception into a variable e
+            print(f"Error in pixel data for file: {fileToProcess}. Error details: {str(e)}")
 
     else:
         print(fileName, "hasAlreadyBeenProcessed")
+
     return 0
 
 
@@ -321,13 +326,12 @@ def extract_avi_and_metadata(
 
     count = 0
     final_list = []
-    for index, row in tqdm(df.iterrows()):
+    for index, row in tqdm(df.iterrows(), desc="Processing rows", total=len(df)):
         if not os.path.exists(destinationFolder):
             os.makedirs(destinationFolder)
             print("Making output directory as it doesn't exist", destinationFolder)
         count += 1
         VideoPath = os.path.join(row["path"])
-        print(count, row["path"])
         if not os.path.exists(
             os.path.join(destinationFolder, row["path"][row["path"].rindex("/") + 1 :] + ".avi")
         ):
@@ -365,7 +369,6 @@ def main(args=None):
     parser = parser.parse_args(args)
 
     df = pd.read_csv(parser.input_file)
-    print(df)
     extract_avi_and_metadata(
         parser.input_file,
         data_type=parser.data_type,
