@@ -83,8 +83,7 @@ def mask_and_crop(movie):
 
 # In[164]:
 def dicom_dataset_to_dict(dicom_header, fileToProcess):
-    dicom_dict = {}
-    dicom_dict["file"] = fileToProcess
+    dicom_dict = {"file": fileToProcess}
     repr(dicom_header)
 
     discard_tags = [
@@ -113,7 +112,7 @@ def dicom_dataset_to_dict(dicom_header, fileToProcess):
                 )
             else:
                 v = _convert_value(dicom_value.value)
-                if str(dicom_value.tag) in dicom_dict.keys():
+                if str(dicom_value.tag) in dicom_dict:
                     try:
                         dicom_dict.setdefault(str(dicom_value.tag), []).append(v)
                     except:
@@ -133,19 +132,18 @@ def _sanitise_unicode(s):
 def _convert_value(v):
     t = type(v)
     if t in (list, int, float):
-        cv = v
+        return v
     elif t == str:
-        cv = _sanitise_unicode(v)
+        return _sanitise_unicode(v)
     elif t == bytes:
         s = v.decode("ascii", "replace")
-        cv = _sanitise_unicode(s)
+        return _sanitise_unicode(s)
     elif t == dicom.valuerep.DSfloat:
-        cv = float(v)
+        return float(v)
     elif t == dicom.valuerep.IS:
-        cv = int(v)
+        return int(v)
     else:
-        cv = repr(v)
-    return cv
+        return repr(v)
 
 
 def normalize_16bit_to_8bit(array):
@@ -296,8 +294,9 @@ def process_metadata(metadata, data_type):
 
     # Fill in the default FPS if not provided
     fps_col_names = ["FPS", "fps_2", "fps_3"]
-    fps_col_names = [name for name in fps_col_names if name in metadata.columns]
-    if fps_col_names:
+    if fps_col_names := [
+        name for name in fps_col_names if name in metadata.columns
+    ]:
         metadata["FPS"] = metadata[fps_col_names].bfill(axis=1).iloc[:, 0]
         metadata = metadata.drop(columns=fps_col_names[1:])
     else:
@@ -316,13 +315,11 @@ def extract_avi_and_metadata(
 ):
     df = pd.read_csv(path)
 
-    count = 0
     final_list = []
-    for index, row in tqdm(df.iterrows(), desc="Processing rows", total=len(df)):
+    for count, (index, row) in enumerate(tqdm(df.iterrows(), desc="Processing rows", total=len(df))):
         if not os.path.exists(destinationFolder):
             os.makedirs(destinationFolder)
             print("Making output directory as it doesn't exist", destinationFolder)
-        count += 1
         try:
             VideoPath = os.path.join(row["path"])
         except:
