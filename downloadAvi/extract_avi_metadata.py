@@ -148,7 +148,11 @@ def _convert_value(v):
     return cv
 
 
-# In[165]:
+def normalize_16bit_to_8bit(array):
+    """Normalize a 16-bit array to an 8-bit array."""
+    array_min, array_max = array.min(), array.max()
+    normalized_array = (array - array_min) / (array_max - array_min) * 255
+    return normalized_array.astype(np.uint8)
 
 
 def makeVideo(fileToProcess, destinationFolder, datatype="ANGIO"):
@@ -158,66 +162,57 @@ def makeVideo(fileToProcess, destinationFolder, datatype="ANGIO"):
     ]  # hex(abs(hash(fileToProcess.split('/')[-1]))).upper()
     fileName = fileName_2 + "_" + fileName_1
     dicom_dict = {}
+    uint16_value = False
     if not os.path.isdir(os.path.join(destinationFolder, fileName)):
         dataset = dicom.dcmread(fileToProcess, force=True)
         try:
             testarray = dataset.pixel_array
-            testarray = np.stack((testarray,) * 3, axis=-1)
-            if datatype == "ANGIO":
-                fps = 15
+
+            # Check if the pixel data is in 16-bit format and normalize if necessary
+            if testarray.dtype == np.uint16:
+                testarray = normalize_16bit_to_8bit(testarray)
+                uint16_value = True
+
+            testarray = np.stack((testarray,) * 3, axis=-1)  # Convert to 3-channel
+
+            # Determine fps
+            fps = 15  # default fps
+            frame_rate_tags = [(0x08, 0x2144), (0x18, 0x1063), (0x18, 0x40), (0x7FDF, 0x1074)]
+            for tag in frame_rate_tags:
                 try:
-                    fps = dataset[(0x08, 0x2144)].value
-                except:
-                    try:
-                        fps = int(1000 / dataset[(0x18, 0x1063)].value)
-                    except:
-                        try:
-                            fps = dataset[(0x18, 0x40)].value
-                        except:
-                            try:
-                                fps = dataset[(0x7FDF, 0x1074)].value
-                            except:
-                                print("couldn't find frame rate, default to 15")
-            else:
-                try:
-                    fps = dataset[(0x18, 0x1063)].value
-                except:
-                    try:
-                        fps = dataset[(0x18, 0x40)].value
-                    except:
-                        try:
-                            fps = dataset[(0x7FDF, 0x1074)].value
-                        except:
-                            fps = 30
-                            print("couldn't find frame rate, default to 30")
+                    fps = dataset[tag].value
+                    break
+                except KeyError:
+                    continue
+            if datatype != "ANGIO" and fps == 15:
+                fps = 30
 
             fourcc = cv2.VideoWriter_fourcc("M", "J", "P", "G")
 
-            ## If destinationFolder doesn't exist, create it
+            # Create destination folder if it doesn't exist
             if not os.path.isdir(destinationFolder):
                 print("Creating ", destinationFolder)
                 os.makedirs(destinationFolder)
 
             video_filename = os.path.join(destinationFolder, fileName + ".avi")
-
-            # Requires for TTE:
-            # finaloutput = dicom.pixel_data_handlers.convert_color_space(testarray,'YBR_FULL', 'RGB')
-            # finaloutput = mask_and_crop(testarray)
             out = cv2.VideoWriter(video_filename, fourcc, fps, testarray.shape[1:3])
+
+            # Write video
             try:
                 for i in testarray:
                     out.write(i)
                 out.release()
                 dicom_dict = dicom_dataset_to_dict(dataset, fileToProcess)
                 dicom_dict["video_path"] = video_filename
+                dicom_dict["uint16_video"] = uint16_value
+                print(dicom_dict)
                 return dicom_dict
-            except Exception as e:  # Catch the exception into a variable e
+            except Exception as e:
                 print(
                     f"Error while writing video for file: {fileToProcess}. Error details: {str(e)}"
                 )
-        except Exception as e:  # Catch the exception into a variable e
+        except Exception as e:
             print(f"Error in pixel data for file: {fileToProcess}. Error details: {str(e)}")
-
     else:
         print(fileName, "hasAlreadyBeenProcessed")
 
@@ -241,6 +236,7 @@ DICOM_DICT = {
         "(0020, 000e)": "SeriesInstanceUID",
         "file": "dicom_path",
         "video_path": "FileName",
+        "uint16_video": "uint16_video",
         "(0018, 1510)": "primary_angle",
         "(0018, 1511)": "secondary_angle",
         "(0028, 0010)": "width",
@@ -319,10 +315,6 @@ def extract_avi_and_metadata(
     dataFolder="data/",
 ):
     df = pd.read_csv(path)
-    try:
-        df["path"] = df["DICOMPath"]
-    except:
-        print("DICOMPath doesn't exist")
 
     count = 0
     final_list = []
@@ -331,7 +323,11 @@ def extract_avi_and_metadata(
             os.makedirs(destinationFolder)
             print("Making output directory as it doesn't exist", destinationFolder)
         count += 1
-        VideoPath = os.path.join(row["path"])
+        try:
+            VideoPath = os.path.join(row["path"])
+        except:
+            print("VideoPath doesn't exist", row["path"])
+
         if not os.path.exists(
             os.path.join(destinationFolder, row["path"][row["path"].rindex("/") + 1 :] + ".avi")
         ):
@@ -380,3 +376,5 @@ def main(args=None):
 
 if __name__ == "__main__":
     main()
+
+# %%
