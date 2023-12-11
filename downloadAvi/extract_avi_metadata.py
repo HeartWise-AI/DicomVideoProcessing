@@ -203,7 +203,7 @@ def makeVideo(fileToProcess, destinationFolder, datatype="ANGIO"):
                 dicom_dict = dicom_dataset_to_dict(dataset, fileToProcess)
                 dicom_dict["video_path"] = video_filename
                 dicom_dict["uint16_video"] = uint16_value
-                print(dicom_dict)
+                # print(dicom_dict)
                 return dicom_dict
             except Exception as e:
                 print(
@@ -294,9 +294,7 @@ def process_metadata(metadata, data_type):
 
     # Fill in the default FPS if not provided
     fps_col_names = ["FPS", "fps_2", "fps_3"]
-    if fps_col_names := [
-        name for name in fps_col_names if name in metadata.columns
-    ]:
+    if fps_col_names := [name for name in fps_col_names if name in metadata.columns]:
         metadata["FPS"] = metadata[fps_col_names].bfill(axis=1).iloc[:, 0]
         metadata = metadata.drop(columns=fps_col_names[1:])
     else:
@@ -316,7 +314,9 @@ def extract_avi_and_metadata(
     df = pd.read_csv(path)
 
     final_list = []
-    for count, (index, row) in enumerate(tqdm(df.iterrows(), desc="Processing rows", total=len(df))):
+    for count, (index, row) in enumerate(
+        tqdm(df.iterrows(), desc="Processing rows", total=len(df))
+    ):
         if not os.path.exists(destinationFolder):
             os.makedirs(destinationFolder)
             print("Making output directory as it doesn't exist", destinationFolder)
