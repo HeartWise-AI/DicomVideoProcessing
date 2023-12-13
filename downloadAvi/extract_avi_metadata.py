@@ -310,6 +310,8 @@ def extract_avi_and_metadata(
     data_type="ANGIO",
     destinationFolder="dicom_avi_extracted/",
     dataFolder="data/",
+    dicom_path_column="path",
+    subdirectory=None,  # Adding the subdirectory parameter
 ):
     df = pd.read_csv(path)
 
@@ -317,18 +319,25 @@ def extract_avi_and_metadata(
     for count, (index, row) in enumerate(
         tqdm(df.iterrows(), desc="Processing rows", total=len(df))
     ):
-        if not os.path.exists(destinationFolder):
-            os.makedirs(destinationFolder)
-            print("Making output directory as it doesn't exist", destinationFolder)
-        try:
-            VideoPath = os.path.join(row["path"])
-        except:
-            print("VideoPath doesn't exist", row["path"])
+        # Check if subdirectory parameter is used and valid
+        if subdirectory and subdirectory in row:
+            subfolder = str(row[subdirectory]) + "/"
+            destinationPath = os.path.join(destinationFolder, subfolder)
+        else:
+            destinationPath = destinationFolder
 
-        if not os.path.exists(
-            os.path.join(destinationFolder, row["path"][row["path"].rindex("/") + 1 :] + ".avi")
-        ):
-            dicom_metadata = makeVideo(VideoPath, destinationFolder)
+        if not os.path.exists(destinationPath):
+            os.makedirs(destinationPath)
+            print("Making output directory as it doesn't exist", destinationPath)
+
+        try:
+            VideoPath = os.path.join(row[dicom_path_column])
+        except:
+            print("VideoPath doesn't exist", row[dicom_path_column])
+
+        outputFileName = row[dicom_path_column][row[dicom_path_column].rindex("/") + 1 :] + ".avi"
+        if not os.path.exists(os.path.join(destinationPath, outputFileName)):
+            dicom_metadata = makeVideo(VideoPath, destinationPath)
             if isinstance(dicom_metadata, dict):
                 final_list.append(dicom_metadata)
         else:
@@ -355,7 +364,9 @@ def main(args=None):
     parser = argparse.ArgumentParser(description="Predictions.")
 
     parser.add_argument("--input_file")
+    parser.add_argument("--dicom_path_column")
     parser.add_argument("--destinationFolder")
+    parser.add_argument("--subdirectory")
     parser.add_argument("--dataFolder")
     parser.add_argument("--data_type")
 
@@ -365,7 +376,9 @@ def main(args=None):
     extract_avi_and_metadata(
         parser.input_file,
         data_type=parser.data_type,
+        dicom_path_column=parser.dicom_path_column,
         destinationFolder=parser.destinationFolder,
+        subdirectory=parser.subdirectory,
         dataFolder=parser.dataFolder,
     )
     print("Done")
