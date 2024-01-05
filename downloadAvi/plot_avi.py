@@ -4,7 +4,9 @@ import numpy as np
 import pandas as pd
 
 
-def sample_and_plot_middle_frames(df, N, label_column=None, second_label_column=None):
+def sample_and_plot_middle_frames(
+    df, N, label_column=None, second_label_column=None, path_column=None
+):
     """
     Randomly samples N filenames from the DataFrame and plots the middle frames of the corresponding videos.
 
@@ -24,11 +26,14 @@ def sample_and_plot_middle_frames(df, N, label_column=None, second_label_column=
         sample_and_plot_middle_frames(df, 5, label_column='Label1', second_label_column='Label2')
     """
 
-    sampled_filenames = df["FileName"].sample(N)
+    sampled_filenames = df[path_column].sample(N, replace=True)
 
     # Calculate the number of rows and columns for the subplots
     num_rows = (N + 4) // 5
     num_cols = min(N, 5)
+    df[label_column] = df[label_column].astype(str)
+    if second_label_column:
+        df[second_label_column] = df[second_label_column].astype(str)
 
     # Set up the plot
     fig, axes = plt.subplots(num_rows, num_cols, figsize=(num_cols * 5, num_rows * 5))
@@ -72,11 +77,11 @@ def sample_and_plot_middle_frames(df, N, label_column=None, second_label_column=
             # Set the title based on provided label columns
             title = f"Frame {middle_frame_number}"
             if label_column:
-                subtitle = df.loc[df["FileName"] == filename, label_column].values[0]
+                subtitle = df.loc[df[path_column] == filename, label_column].values[0]
                 title = subtitle
 
             if second_label_column:
-                second_subtitle = df.loc[df["FileName"] == filename, second_label_column].values[
+                second_subtitle = df.loc[df[path_column] == filename, second_label_column].values[
                     0
                 ]
                 title += f" - {second_subtitle}"
