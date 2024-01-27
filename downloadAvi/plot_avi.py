@@ -15,6 +15,7 @@ def sample_and_plot_middle_frames(
         N: The number of filenames to sample.
         label_column: The column in the DataFrame containing labels (optional).
         second_label_column: The second column in the DataFrame containing labels (optional).
+        path_column: The column in the DataFrame containing the file paths.
 
     Returns:
         None
@@ -27,7 +28,6 @@ def sample_and_plot_middle_frames(
     """
 
     sampled_filenames = df[path_column].sample(N, replace=True)
-
     # Calculate the number of rows and columns for the subplots
     num_rows = (N + 4) // 5
     num_cols = min(N, 5)
@@ -44,49 +44,57 @@ def sample_and_plot_middle_frames(
         # Calculate the row and column index for the current subplot
         row_idx = i // num_cols
         col_idx = i % num_cols
+        print(filename)
 
-        # Read the video file
-        cap = cv2.VideoCapture(filename)
+        if filename.endswith(".dcm"):
+            # Load DICOM file using pydicom
+            ds = pydicom.dcmread(filename)
+            frame = ds.pixel_array
+        elif filename.endswith(".avi"):
+            # Read the video file using cv2
+            cap = cv2.VideoCapture(filename)
 
-        # Get the total number of frames
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            # Get the total number of frames
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-        # Calculate the middle frame number
-        middle_frame_number = total_frames // 2
+            # Calculate the middle frame number
+            middle_frame_number = total_frames // 2
 
-        # Set the current frame position to the middle frame
-        cap.set(cv2.CAP_PROP_POS_FRAMES, middle_frame_number)
+            # Set the current frame position to the middle frame
+            cap.set(cv2.CAP_PROP_POS_FRAMES, middle_frame_number)
 
-        # Read the middle frame
-        ret, frame = cap.read()
+            # Read the middle frame
+            ret, frame = cap.read()
 
-        # Close the video file
-        cap.release()
+            # Close the video file
+            cap.release()
 
-        if ret:
-            # Convert the frame from BGR to RGB (as Matplotlib displays in RGB)
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            if not ret:
+                continue
+        else:
+            continue
 
-            # Get the subplot reference
-            ax = axes[row_idx][col_idx] if num_rows > 1 else axes[col_idx]
+        # Convert the frame from BGR to RGB (as Matplotlib displays in RGB)
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-            # Plotting the frame
-            ax.imshow(frame_rgb)
-            ax.axis("off")
+        # Get the subplot reference
+        ax = axes[row_idx][col_idx] if num_rows > 1 else axes[col_idx]
 
-            # Set the title based on provided label columns
-            title = f"Frame {middle_frame_number}"
-            if label_column:
-                subtitle = df.loc[df[path_column] == filename, label_column].values[0]
-                title = subtitle
+        # Plotting the frame
+        ax.imshow(frame_rgb)
+        ax.axis("off")
 
-            if second_label_column:
-                second_subtitle = df.loc[df[path_column] == filename, second_label_column].values[
-                    0
-                ]
-                title += f" - {second_subtitle}"
+        # Set the title based on provided label columns
+        title = f"Frame {middle_frame_number}"
+        if label_column:
+            subtitle = df.loc[df[path_column] == filename, label_column].values[0]
+            title = subtitle
 
-            ax.set_title(title)
+        if second_label_column:
+            second_subtitle = df.loc[df[path_column] == filename, second_label_column].values[0]
+            title += f" - {second_subtitle}"
+
+        ax.set_title(title)
 
     # Adjust layout and show the plot
     plt.tight_layout()
