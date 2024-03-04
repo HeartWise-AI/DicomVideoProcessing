@@ -191,24 +191,30 @@ def makeVideo(fileToProcess, destinationFolder, datatype="ANGIO"):
             if not os.path.isdir(destinationFolder):
                 print("Creating ", destinationFolder)
                 os.makedirs(destinationFolder)
-
             video_filename = os.path.join(destinationFolder, fileName + ".avi")
-            out = cv2.VideoWriter(video_filename, fourcc, fps, testarray.shape[1:3])
 
-            # Write video
-            try:
-                for i in testarray:
-                    out.write(i)
-                out.release()
+            if not os.path.exists(video_filename):
+                out = cv2.VideoWriter(video_filename, fourcc, fps, testarray.shape[1:3])
+
+                # Write video
+                try:
+                    for i in testarray:
+                        out.write(i)
+                    out.release()
+                    dicom_dict = dicom_dataset_to_dict(dataset, fileToProcess)
+                    dicom_dict["video_path"] = video_filename
+                    dicom_dict["uint16_video"] = uint16_value
+                    return dicom_dict
+                except Exception as e:
+                    print(
+                        f"Error while writing video for file: {fileToProcess}. Error details: {str(e)}"
+                    )
+            else:
+                # print(f"Error: Video filename {video_filename} already exists.")
                 dicom_dict = dicom_dataset_to_dict(dataset, fileToProcess)
                 dicom_dict["video_path"] = video_filename
                 dicom_dict["uint16_video"] = uint16_value
-                # print(dicom_dict)
                 return dicom_dict
-            except Exception as e:
-                print(
-                    f"Error while writing video for file: {fileToProcess}. Error details: {str(e)}"
-                )
         except Exception as e:
             print(f"Error in pixel data for file: {fileToProcess}. Error details: {str(e)}")
     else:
@@ -294,13 +300,13 @@ def process_metadata(metadata, data_type):
 
     # Fill in the default FPS if not provided
     fps_col_names = ["FPS", "fps_2", "fps_3"]
-    if fps_col_names := [name for name in fps_col_names if name in metadata.columns]:
-        metadata["FPS"] = metadata[fps_col_names].bfill(axis=1).iloc[:, 0]
+    fps_col_names = [name for name in fps_col_names if name in metadata.columns]
+    if fps_col_names:
+        metadata.loc[:, "FPS"] = metadata[fps_col_names].bfill(axis=1).iloc[:, 0]
         metadata = metadata.drop(columns=fps_col_names[1:])
     else:
-        metadata["FPS"] = 1.0  # default value if no FPS information is present
-
-    metadata["StudyInstanceUID"] = metadata["StudyInstanceUID"].str.replace("'", "")
+        metadata.loc[:, "FPS"] = 1.0  # default value if no FPS information is present
+    metadata["StudyInstanceUID"] = metadata["StudyInstanceUID"].astype(str).str.replace("'", "")
 
     return metadata
 
@@ -314,15 +320,30 @@ def extract_avi_and_metadata(
     subdirectory=None,  # Adding the subdirectory parameter
 ):
     df = pd.read_csv(path)
+    if not os.path.exists(dataFolder):
+        os.makedirs(dataFolder)
+        print("Making output directory as it doesn't exist", dataFolder)
+    fileName_1 = path.split("/")[-1]
+    final_path = os.path.join(dataFolder, fileName_1 + "_metadata_extracted.csv")
+    final_path_mu = os.path.join(dataFolder, fileName_1 + "_metadata_extracted_mu.csv")
+    if os.path.exists(final_path):
+        raise FileExistsError(
+            f"The file {final_path} already exists and cannot be created again."
+        )
 
     final_list = []
     for count, (index, row) in enumerate(
         tqdm(df.iterrows(), desc="Processing rows", total=len(df))
     ):
         # Check if subdirectory parameter is used and valid
-        if subdirectory and subdirectory in row:
-            subfolder = str(row[subdirectory]) + "/"
-            destinationPath = os.path.join(destinationFolder, subfolder)
+        if subdirectory:
+            if subdirectory in row:
+                subfolder = str(row[subdirectory]) + "/"
+                destinationPath = os.path.join(destinationFolder, subfolder)
+            else:
+                raise ValueError(
+                    f"Subdirectory '{subdirectory}' is defined but not found in the row."
+                )
         else:
             destinationPath = destinationFolder
 
@@ -332,27 +353,23 @@ def extract_avi_and_metadata(
 
         try:
             VideoPath = os.path.join(row[dicom_path_column])
-        except:
-            print("VideoPath doesn't exist", row[dicom_path_column])
-
-        outputFileName = row[dicom_path_column][row[dicom_path_column].rindex("/") + 1 :] + ".avi"
-        if not os.path.exists(os.path.join(destinationPath, outputFileName)):
+            outputFileName = (
+                row[dicom_path_column][row[dicom_path_column].rindex("/") + 1 :] + ".avi"
+            )
             dicom_metadata = makeVideo(VideoPath, destinationPath)
             if isinstance(dicom_metadata, dict):
                 final_list.append(dicom_metadata)
-        else:
-            print("Already did this file", VideoPath)
+        except:
+            print("VideoPath doesn't exist", row[dicom_path_column])
 
     dicom_df_final = pd.DataFrame(final_list)
 
     dicom_df_final = process_metadata(dicom_df_final, data_type)
     dicom_df_final["Split"] = "inference"
-    fileName_1 = path.split("/")[-1]
-    final_path = dataFolder + fileName_1 + "_metadata_extracted.csv"
-    final_path_mu = dataFolder + fileName_1 + "_metadata_extracted_mu.csv"
 
     dicom_df_final.to_csv(final_path)
     reader = csv.reader(open(final_path), delimiter=",")
+    print(final_path)
     writer = csv.writer(open(final_path_mu, "w"), delimiter="µ")
     writer.writerows(reader)
     return dicom_df_final
