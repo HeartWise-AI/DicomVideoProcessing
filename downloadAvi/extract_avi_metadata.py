@@ -311,6 +311,132 @@ def process_metadata(metadata, data_type):
     return metadata
 
 
+# Helper function to convert DICOM dataset to dictionary
+def dicom_dataset_to_dict(dicom_header, fileToProcess):
+    dicom_dict = {"file": fileToProcess}
+    for element in dicom_header:
+        if element.VR != "SQ" and element.tag != (
+            0x7FE0,
+            0x0010,
+        ):  # skip sequences and pixel data
+            dicom_dict[element.keyword] = str(element.value)
+    return dicom_dict
+
+
+def extract_mp4_with_labels_and_metadata(
+    df, path_column, label_column=None, second_label_column=None, destinationFolder=None
+):
+    """
+    Saves .mp4 files with labels from label_column and second_label_column displayed on the video,
+    and also saves metadata.
+
+    Args:
+        df: DataFrame containing the video file paths and labels.
+        path_column: Column name containing the file paths.
+        label_column: Column name for the primary label (optional).
+        second_label_column: Column name for the secondary label (optional).
+        destinationFolder: Folder where the output videos will be saved.
+    """
+    metadata_list = []
+    for index, row in tqdm(df.iterrows()):
+        dicom_path = row[path_column]
+        try:
+            dataset = dicom.dcmread(dicom_path, force=True)
+            frames = dataset.pixel_array
+        except Exception as e:
+            print(f"Failed to read DICOM file {dicom_path}: {str(e)}")
+            continue
+
+        if frames.dtype == np.uint16:
+            frames = (frames / frames.max()) * 255.0  # Normalize to 8-bit
+            frames = frames.astype(np.uint8)
+
+        if len(frames.shape) == 3:  # Assuming multiple frames
+            height, width = frames.shape[1], frames.shape[2]
+        else:
+            height, width = frames.shape
+
+        # Determine fps
+        fps = 15  # default fps
+        frame_rate_tags = [(0x08, 0x2144), (0x18, 0x1063), (0x18, 0x40), (0x7FDF, 0x1074)]
+        for tag in frame_rate_tags:
+            try:
+                fps = dataset[tag].value
+                break
+            except KeyError:
+                continue
+
+        # Define codec and create VideoWriter object using MP4V codec
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+
+        if destinationFolder and not os.path.exists(destinationFolder):
+            os.makedirs(destinationFolder)
+        output_path = os.path.join(
+            destinationFolder if destinationFolder else "",
+            dicom_path.split("/")[-1].replace(".dcm", "_labeled.mp4"),
+        )
+        out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+
+        dicom_dict = dicom_dataset_to_dict(dataset, dicom_path)
+        dicom_dict["FileName"] = output_path
+        metadata_list.append(dicom_dict)
+
+        if len(frames.shape) == 3:  # Assuming multiple frames, process each frame
+            for frame in frames:
+                if len(frame.shape) == 2:  # Convert grayscale to RGB
+                    frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+
+                # Draw labels on the frame
+                label_text = row[label_column] if label_column in df.columns else ""
+                second_label_text = (
+                    str(row[second_label_column]) if second_label_column in df.columns else ""
+                )
+                cv2.putText(
+                    frame,
+                    str(label_text),
+                    (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1,
+                    (255, 255, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
+                cv2.putText(
+                    frame,
+                    second_label_text,
+                    (10, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1,
+                    (255, 255, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
+                # Write the frame with labels
+                out.write(frame)
+
+        # Release everything when job is finished
+        out.release()
+        # print(f"Labeled video saved as {output_path}")
+
+    # Save all metadata at once
+    if destinationFolder and not os.path.exists(destinationFolder):
+        os.makedirs(destinationFolder)
+    metadata_filename = os.path.join(
+        destinationFolder if destinationFolder else "", "all_metadata.csv"
+    )
+    metadata_df = pd.DataFrame(metadata_list)
+
+    metadata_df.to_csv(metadata_filename, index=False)
+
+    print(f"All metadata saved as {metadata_filename}")
+
+    return metadata_df
+
+
+if __name__ == "__main__":
+    main()
+
+
 def extract_avi_and_metadata(
     path,
     data_type="ANGIO",

@@ -2,7 +2,8 @@ import cv2
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import pydicom
+import pydicom as dicom
+from tqdm import tqdm
 
 
 def normalize_image(image):
@@ -295,7 +296,3 @@ def main():
         path_column=args.path_column,
     )
     print("Done")
-
-
-if __name__ == "__main__":
-    main()
