@@ -218,7 +218,7 @@ def convert_to_serializable(obj):
 
 
 def extract_h264_video_from_dicom(
-    dicom_path, output_path, crf=23, preset="medium", data_type="ANGIO"
+    dicom_path, output_path, crf=23, preset="medium", data_type="ANGIO", lossless=False
 ):
     dicom_data = pydicom.dcmread(dicom_path)
     pixel_array = dicom_data.pixel_array
@@ -229,14 +229,12 @@ def extract_h264_video_from_dicom(
     for tag in frame_rate_tags:
         try:
             frame_rate = float(dicom_data[tag].value)
-            # print(f"Frame rate: {frame_rate}")
             break
         except (KeyError, AttributeError):
             print(f"Frame rate tag {tag} not found in DICOM file {dicom_path}")
             continue
     if data_type != "ANGIO" and frame_rate == 15:
         frame_rate = 30
-    # print(f"Frame rate: {frame_rate}")
 
     if pixel_array.dtype != np.uint8:
         pixel_array = (
@@ -255,19 +253,38 @@ def extract_h264_video_from_dicom(
                 frame = frame[..., ::-1]  # Convert BGR to RGB if color
             cv2.imwrite(frame_path, frame)
 
-        ffmpeg_command = [
-            "ffmpeg",
-            "-framerate",
-            str(frame_rate),
-            "-i",
-            os.path.join(temp_dir, "frame_%04d.png"),
-            "-c:v",
-            "libx264",
-            "-crf",
-            str(crf),
-            "-y",
-            output_path,
-        ]
+        if lossless:
+            ffmpeg_command = [
+                "ffmpeg",
+                "-framerate",
+                str(frame_rate),
+                "-i",
+                os.path.join(temp_dir, "frame_%04d.png"),
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-qp",
+                "0",
+                "-y",
+                output_path,
+            ]
+        else:
+            ffmpeg_command = [
+                "ffmpeg",
+                "-framerate",
+                str(frame_rate),
+                "-i",
+                os.path.join(temp_dir, "frame_%04d.png"),
+                "-c:v",
+                "libx264",
+                "-crf",
+                str(crf),
+                "-preset",
+                preset,
+                "-y",
+                output_path,
+            ]
 
         try:
             subprocess.run(ffmpeg_command, check=True, capture_output=True, text=True)
@@ -296,6 +313,7 @@ def extract_h264_and_metadata(
     dicom_path_column="path",
     subdirectory=None,
     num_processes=None,
+    lossless=False,
 ):
     from tqdm import tqdm
 
@@ -324,7 +342,7 @@ def extract_h264_and_metadata(
         results = pool.starmap(
             process_row,
             [
-                (row, destinationFolder, subdirectory, dicom_path_column, data_type)
+                (row, destinationFolder, subdirectory, dicom_path_column, data_type, lossless)
                 for _, row in tqdm(df.iterrows())
             ],
         )
@@ -357,7 +375,9 @@ def extract_h264_and_metadata(
     return dicom_df_final
 
 
-def process_row(row, destinationFolder, subdirectory, dicom_path_column, data_type="ANGIO"):
+def process_row(
+    row, destinationFolder, subdirectory, dicom_path_column, data_type="ANGIO", lossless=False
+):
     if subdirectory:
         if subdirectory in row:
             subfolder = str(row[subdirectory]) + "/"
@@ -380,7 +400,7 @@ def process_row(row, destinationFolder, subdirectory, dicom_path_column, data_ty
 
     # Extract H.264 video and get metadata
     _, metadata = extract_h264_video_from_dicom(
-        dicom_path, output_path, crf=23, preset="medium", data_type=data_type
+        dicom_path, output_path, lossless=lossless, data_type=data_type
     )
 
     # Convert metadata to serializable format
@@ -423,8 +443,14 @@ def main(args=None):
         type=int,
         help="Number of processes to use (default: number of CPU cores)",
     )
-
+    parser.add_argument(
+        "--lossless",
+        action="store_true",
+        help="Use lossless compression for video extraction",
+    )
     args = parser.parse_args(args)
+
+    print(f"Lossless compression: {args.lossless}")
 
     extract_h264_and_metadata(
         args.input_file,
@@ -434,6 +460,7 @@ def main(args=None):
         subdirectory=args.subdirectory,
         dataFolder=args.dataFolder,
         num_processes=args.num_processes,
+        lossless=args.lossless,
     )
     print("Done")
 
