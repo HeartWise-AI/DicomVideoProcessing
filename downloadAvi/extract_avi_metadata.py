@@ -320,15 +320,12 @@ def extract_h264_and_metadata(
     if num_processes is None:
         num_processes = multiprocessing.cpu_count()
 
-    def process_row_wrapper(args):
-        return process_row(*args)
-
     with multiprocessing.Pool(processes=num_processes) as pool:
         results = pool.starmap(
             process_row,
             [
                 (row, destinationFolder, subdirectory, dicom_path_column, data_type)
-                for _, row in df.iterrows()
+                for _, row in tqdm(df.iterrows())
             ],
         )
     final_list = [json.loads(result) for result in results if result is not None]
