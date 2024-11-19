@@ -1,8 +1,3 @@
-#!/usr/bin/env python
-
-# In[162]:
-
-
 # Notebook which iterates through a folder, including subfolders,
 # and convert DICOM files to AVI files
 import csv
@@ -301,8 +296,168 @@ def extract_h264_video_from_dicom(
     return output_path, dicom_dict
 
 
-if __name__ == "__main__":
-    main()
+def _convert_npz_worker(args):
+    """Worker function for parallel processing"""
+    input_path, output_path, fps, crf, preset, lossless = args
+    try:
+        # Load NPZ file
+        data = np.load(input_path)
+        if "pixel_array" not in data:
+            return {
+                "input_file": input_path,
+                "output_file": output_path,
+                "status": "error",
+                "error_message": "No pixel_array found",
+            }
+
+        pixel_array = data["pixel_array"]
+
+        # Ensure output directory exists
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+        # Normalize pixel values to uint8 if needed
+        if pixel_array.dtype != np.uint8:
+            pixel_array = (
+                (pixel_array - pixel_array.min()) * 255 / (pixel_array.max() - pixel_array.min())
+            ).astype(np.uint8)
+
+        # Create temporary directory for frames
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # Save frames as temporary PNG files
+            for i, frame in enumerate(pixel_array):
+                frame_path = os.path.join(temp_dir, f"frame_{i:04d}.png")
+                cv2.imwrite(frame_path, frame)
+
+            # Construct FFmpeg command
+            if lossless:
+                ffmpeg_command = [
+                    "ffmpeg",
+                    "-framerate",
+                    str(fps),
+                    "-i",
+                    os.path.join(temp_dir, "frame_%04d.png"),
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "ultrafast",
+                    "-qp",
+                    "0",
+                    "-y",
+                    output_path,
+                ]
+            else:
+                ffmpeg_command = [
+                    "ffmpeg",
+                    "-framerate",
+                    str(fps),
+                    "-i",
+                    os.path.join(temp_dir, "frame_%04d.png"),
+                    "-c:v",
+                    "libx264",
+                    "-crf",
+                    str(crf),
+                    "-preset",
+                    preset,
+                    "-y",
+                    output_path,
+                ]
+
+            # Run FFmpeg
+            result = subprocess.run(ffmpeg_command, capture_output=True, text=True)
+            if result.returncode != 0:
+                return {
+                    "input_file": input_path,
+                    "output_file": output_path,
+                    "status": "error",
+                    "error_message": result.stderr,
+                }
+
+        return {
+            "input_file": input_path,
+            "output_file": output_path,
+            "num_frames": len(pixel_array),
+            "fps": fps,
+            "frame_shape": str(pixel_array[0].shape),
+            "compression": "lossless" if lossless else f"crf{crf}",
+            "status": "success",
+            "error_message": "",
+        }
+
+    except Exception as e:
+        return {
+            "input_file": input_path,
+            "output_file": output_path,
+            "status": "error",
+            "error_message": str(e),
+        }
+
+
+def convert_npz_batch_to_h264(
+    input_df,
+    file_path_column,
+    output_dir,
+    fps=30,
+    crf=23,
+    preset="medium",
+    lossless=False,
+    num_processes=None,
+):
+    """
+    Convert batch of NPZ files to H.264 videos in parallel.
+
+    Args:
+        input_df (pd.DataFrame): DataFrame containing file paths
+        file_path_column (str): Name of column containing NPZ file paths
+        output_dir (str): Directory to save output videos
+        fps (int): Frames per second for output videos
+        crf (int): Constant Rate Factor for H.264 compression
+        preset (str): FFmpeg preset
+        lossless (bool): Whether to use lossless compression
+        num_processes (int): Number of parallel processes to use
+    """
+    if file_path_column not in input_df.columns:
+        raise ValueError(f"Column '{file_path_column}' not found in input DataFrame")
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    if num_processes is None:
+        num_processes = multiprocessing.cpu_count()
+
+    # Prepare arguments for parallel processing
+    process_args = []
+    for _, row in input_df.iterrows():
+        input_path = row[file_path_column]
+        # Preserve directory structure
+        rel_path = os.path.relpath(
+            input_path, "/media/data1/ravram/CoronaryDominance/extracted_data/"
+        )
+        output_path = os.path.join(output_dir, rel_path).replace(".npz", ".mp4")
+        os.makedirs(
+            os.path.dirname(output_path), exist_ok=True
+        )  # Create output directory if it doesn't exist
+
+        process_args.append((input_path, output_path, fps, crf, preset, lossless))
+
+    # Process files in parallel
+    with multiprocessing.Pool(processes=num_processes) as pool:
+        results = list(
+            tqdm(
+                pool.imap(_convert_npz_worker, process_args),
+                total=len(process_args),
+                desc="Converting NPZ files",
+            )
+        )
+
+    # Create metadata DataFrame
+    metadata_df = pd.DataFrame(results)
+
+    # Add input and output paths to metadata
+    metadata_df["input_path"] = [args[0] for args in process_args]
+    metadata_df["output_path"] = [args[1] for args in process_args]
+
+    metadata_path = os.path.join(output_dir, "conversion_metadata.csv")
+    metadata_df.to_csv(metadata_path, index=False)
+    return metadata_df
 
 
 def extract_h264_and_metadata(
@@ -423,49 +578,80 @@ def main(args=None):
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Extract H.264 videos and metadata from DICOM files."
+        description="Extract H.264 videos and metadata from DICOM or NPZ files."
     )
 
+    # Input arguments
     parser.add_argument("--input_file", required=True, help="Path to the input CSV file")
     parser.add_argument(
-        "--dicom_path_column", required=True, help="Column name for DICOM file paths"
+        "--file_type",
+        required=True,
+        choices=["dicom", "npz"],
+        help="Type of files to process (dicom or npz)",
     )
     parser.add_argument(
-        "--destinationFolder", required=True, help="Destination folder for extracted videos"
+        "--file_path_column",
+        required=True,
+        help="Column name containing file paths (DICOM or NPZ)",
+    )
+
+    # Output arguments
+    parser.add_argument(
+        "--output_dir", required=True, help="Destination folder for extracted videos"
+    )
+    parser.add_argument(
+        "--metadata_dir", required=True, help="Folder for output metadata CSV files"
     )
     parser.add_argument("--subdirectory", help="Column name for subdirectory information")
-    parser.add_argument(
-        "--dataFolder", required=True, help="Folder for output metadata CSV files"
-    )
-    parser.add_argument("--data_type", default="ANGIO", help="Type of data (e.g., 'ANGIO')")
+
+    # Processing options
+    parser.add_argument("--data_type", default="ANGIO", help="Type of DICOM data (e.g., 'ANGIO')")
+    parser.add_argument("--fps", type=int, default=30, help="Frames per second for output video")
     parser.add_argument(
         "--num_processes",
         type=int,
         help="Number of processes to use (default: number of CPU cores)",
     )
     parser.add_argument(
-        "--lossless",
-        action="store_true",
-        help="Use lossless compression for video extraction",
+        "--lossless", action="store_true", help="Use lossless compression for video extraction"
     )
+
     args = parser.parse_args(args)
 
+    print(f"Processing {args.file_type} files")
+    print(f"Input file: {args.input_file}")
+    print(f"File path column: {args.file_path_column}")
+    print(f"Output directory: {args.output_dir}")
     print(f"Lossless compression: {args.lossless}")
 
-    extract_h264_and_metadata(
-        args.input_file,
-        data_type=args.data_type,
-        dicom_path_column=args.dicom_path_column,
-        destinationFolder=args.destinationFolder,
-        subdirectory=args.subdirectory,
-        dataFolder=args.dataFolder,
-        num_processes=args.num_processes,
-        lossless=args.lossless,
-    )
+    if args.file_type == "dicom":
+        extract_h264_and_metadata(
+            args.input_file,
+            data_type=args.data_type,
+            dicom_path_column=args.file_path_column,
+            destinationFolder=args.output_dir,
+            subdirectory=args.subdirectory,
+            dataFolder=args.metadata_dir,
+            num_processes=args.num_processes,
+            lossless=args.lossless,
+        )
+    else:  # npz
+        df = pd.read_csv(args.input_file)
+        metadata_df = convert_npz_batch_to_h264(
+            df,
+            args.file_path_column,
+            args.output_dir,
+            fps=args.fps,
+            lossless=args.lossless,
+            num_processes=args.num_processes,
+        )
+        print(f"\nConversion summary:")
+        print(f"Total files processed: {len(metadata_df)}")
+        print(f"Successful conversions: {len(metadata_df[metadata_df['status'] == 'success'])}")
+        print(f"Failed conversions: {len(metadata_df[metadata_df['status'] == 'error'])}")
+
     print("Done")
 
 
 if __name__ == "__main__":
     main()
-
-# %%
