@@ -14,6 +14,7 @@ import pydicom
 from pydicom.uid import UID, generate_uid
 from tqdm import tqdm
 
+# Dictionary to map DICOM tags to simplified column names
 DICOM_DICT = {
     "ANGIO": {
         "(0008, 0070)": "brand",
@@ -73,6 +74,63 @@ DICOM_DICT = {
         "video_path": "FileName",
     },
 }
+
+
+def convert_to_serializable(obj, max_length=5000):
+    """
+    Convert pydicom / numpy data types to standard Python types for JSON.
+    We also skip or truncate large binary fields (e.g., waveforms).
+    """
+    import pydicom
+    from pydicom.dataset import Dataset as DicomDataset
+    from pydicom.sequence import Sequence as DicomSequence
+
+    if isinstance(obj, (pydicom.multival.MultiValue, pydicom.valuerep.PersonName)):
+        return str(obj)
+    elif isinstance(obj, pydicom.valuerep.DSfloat):
+        return float(obj)
+    elif isinstance(obj, pydicom.valuerep.IS):
+        return int(obj)
+    elif isinstance(obj, pydicom.uid.UID):
+        return str(obj)
+    elif isinstance(obj, bytes):
+        # If it's large (e.g., waveforms), skip or truncate
+        if len(obj) > max_length:
+            return f"<binary data, length={len(obj)} truncated>"
+        try:
+            return obj.decode("utf-8", "ignore")[:max_length]
+        except UnicodeDecodeError:
+            return f"<binary data, length={len(obj)}>"
+    elif isinstance(obj, np.integer):
+        return int(obj)
+    elif isinstance(obj, np.floating):
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        # If array is large, truncate
+        if obj.size > max_length:
+            return f"<large ndarray, shape={obj.shape}, dtype={obj.dtype}>"
+        else:
+            return obj.tolist()
+    elif isinstance(obj, DicomSequence):
+        return [convert_to_serializable(ds, max_length) for ds in obj]
+    elif isinstance(obj, DicomDataset):
+        # Convert each element except PixelData, CurveData, or waveforms
+        serial_dict = {}
+        for elem in obj.iterall():
+            tag_str = f"({elem.tag.group:04x}, {elem.tag.element:04x})"
+            # Skip PixelData or giant waveforms
+            if elem.keyword in ["PixelData", "WaveformData", "CurveData"]:
+                continue
+            # Some curve data or large binary arrays
+            if tag_str in ["(5000, 3000)", "(7fe0, 0010)"]:
+                continue
+            serial_dict[elem.keyword] = convert_to_serializable(elem.value, max_length)
+        return serial_dict
+    elif isinstance(obj, list):
+        return [convert_to_serializable(item, max_length) for item in obj]
+    elif isinstance(obj, dict):
+        return {k: convert_to_serializable(v, max_length) for k, v in obj.items()}
+    return obj
 
 
 def mask_and_crop(movie):
@@ -182,100 +240,46 @@ def process_metadata(metadata, data_type):
     return processed_metadata
 
 
-def convert_to_serializable(obj):
-    """
-    Safely convert various pydicom / numpy data types to standard Python
-    types that can be JSON-serialized. Extended to handle Sequences
-    and Datasets recursively.
-    """
-    from pydicom.dataset import Dataset as DicomDataset
-    from pydicom.sequence import Sequence as DicomSequence
-
-    if isinstance(obj, (pydicom.multival.MultiValue, pydicom.valuerep.PersonName)):
-        return str(obj)
-    elif isinstance(obj, pydicom.valuerep.DSfloat):
-        return float(obj)
-    elif isinstance(obj, pydicom.valuerep.IS):
-        return int(obj)
-    elif isinstance(obj, pydicom.uid.UID):
-        return str(obj)
-    elif isinstance(obj, bytes):
-        return obj.decode("utf-8", "ignore")
-    elif isinstance(obj, np.integer):
-        return int(obj)
-    elif isinstance(obj, np.floating):
-        return float(obj)
-    elif isinstance(obj, np.ndarray):
-        return obj.tolist()
-    elif isinstance(obj, DicomSequence):
-        # Convert each Dataset in the Sequence
-        return [convert_to_serializable(ds) for ds in obj]
-    elif isinstance(obj, DicomDataset):
-        # Convert each DataElement in the Dataset
-        serial_dict = {}
-        for elem in obj.iterall():
-            if elem.keyword == "PixelData":
-                continue  # skip large pixel data
-            serial_dict[elem.keyword] = convert_to_serializable(elem.value)
-        return serial_dict
-    elif isinstance(obj, list):
-        return [convert_to_serializable(item) for item in obj]
-    elif isinstance(obj, dict):
-        return {k: convert_to_serializable(v) for k, v in obj.items()}
-    return obj
-
-
 def extract_h264_video_from_dicom(
     dicom_path, output_path, crf=23, preset="medium", data_type="ANGIO", lossless=False
 ):
+    """Read DICOM, extract frames to PNG, then encode H.264 with FFmpeg. Return metadata (minus large fields)."""
+    import pydicom
+
     dicom_data = pydicom.dcmread(dicom_path)
+    # If no pixel data, skip
     if not hasattr(dicom_data, "PixelData"):
-        # Return None so we can skip or handle in process_row
         print(f"[WARNING] No pixel data in file: {dicom_path}")
         return None, {"file_path": dicom_path, "error": "No PixelData"}
     pixel_array = dicom_data.pixel_array
 
     # Determine fps
-    frame_rate = 15  # default fps
-    # Update these tags if you need to check more possible frame rate attributes
+    frame_rate = 15
     frame_rate_tags = [(0x08, 0x2144), (0x18, 0x1063), (0x18, 0x40), (0x7FDF, 0x1074)]
     for tag in frame_rate_tags:
         try:
             frame_rate = float(dicom_data[tag].value)
             break
         except (KeyError, AttributeError):
-            # You can comment this out to reduce verbosity
-            # print(f"Frame rate tag {tag} not found in DICOM file {dicom_path}")
-            continue
-
-    # If it’s not ANGIO but we only found the default of 15, bump to 30 as a fallback
+            pass
     if data_type != "ANGIO" and frame_rate == 15:
         frame_rate = 30
 
-    # Normalize to uint8 if needed
+    # Normalize to uint8
     if pixel_array.dtype != np.uint8:
-        pixel_array = (
-            (pixel_array - pixel_array.min()) / (pixel_array.max() - pixel_array.min()) * 255
-        ).astype(np.uint8)
+        pixel_array = (pixel_array - pixel_array.min()) / (pixel_array.max() - pixel_array.min())
+        pixel_array = (pixel_array * 255).astype(np.uint8)
 
-    # Ensure pixel_array has at least 3 dims: (frames, height, width)
     if len(pixel_array.shape) == 2:
         pixel_array = np.expand_dims(pixel_array, axis=0)
 
-    is_color = len(pixel_array.shape) == 4 and pixel_array.shape[-1] == 3
-
+    # Write frames as PNG
     with tempfile.TemporaryDirectory() as temp_dir:
         for i, frame in enumerate(pixel_array):
             frame_path = os.path.join(temp_dir, f"frame_{i:04d}.png")
-            # If color, check channel arrangement
-            if is_color:
-                # Sometimes it's BGR vs. RGB, adapt if needed.
-                # OpenCV typically uses BGR, so you may not need to flip channels here.
-                cv2.imwrite(frame_path, frame)
-            else:
-                cv2.imwrite(frame_path, frame)
+            cv2.imwrite(frame_path, frame)
 
-        # Lossless or CRF-based
+        # Build ffmpeg command
         if lossless:
             ffmpeg_command = [
                 "ffmpeg",
@@ -315,12 +319,15 @@ def extract_h264_video_from_dicom(
             print(f"FFmpeg command failed: {e.stderr.strip()}")
             raise
 
-    # Extract DICOM metadata (excluding PixelData)
-    dicom_dict = {
-        elem.keyword: elem.value for elem in dicom_data.iterall() if elem.keyword != "PixelData"
-    }
-    dicom_dict["video_path"] = output_path
+    # Convert DICOM metadata to serializable dictionary, skipping large/binary fields
+    dicom_dict = {}
+    for elem in dicom_data.iterall():
+        if elem.keyword not in ["PixelData", "WaveformData", "CurveData"]:
+            tag_str = f"({elem.tag.group:04x}, {elem.tag.element:04x})"
+            if tag_str not in ["(5000, 3000)", "(7fe0, 0010)"]:
+                dicom_dict[elem.keyword] = convert_to_serializable(elem.value)
 
+    dicom_dict["video_path"] = output_path
     return output_path, dicom_dict
 
 
@@ -570,8 +577,21 @@ def process_row(
         os.makedirs(destinationPath, exist_ok=True)
     except Exception as e:
         print(f"Error creating directory {destinationPath}: {str(e)}")
+    try:
+        dicom_path = os.path.join(row[dicom_path_column])
+    except KeyError:
+        # Check if the column name is case sensitive
+        if dicom_path_column.lower() in [col.lower() for col in row.index]:
+            # Find the actual column name with correct case
+            actual_col = next(
+                col for col in row.index if col.lower() == dicom_path_column.lower()
+            )
+            dicom_path = os.path.join(row[actual_col])
+        else:
+            raise KeyError(
+                f"Column '{dicom_path_column}' not found in row. Available columns: {list(row.index)}"
+            )
 
-    dicom_path = os.path.join(row[dicom_path_column])
     output_filename = os.path.basename(dicom_path).replace(".dcm", ".mp4")
     output_path = os.path.join(destinationPath, output_filename)
 
