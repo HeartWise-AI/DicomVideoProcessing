@@ -8,17 +8,11 @@ import subprocess
 import tempfile
 
 import cv2
-
-# function for masking and cropping echo movies
 import numpy as np
 import pandas as pd
 import pydicom
 from pydicom.uid import UID, generate_uid
 from tqdm import tqdm
-
-# sys.stdout = open(1, "w")
-# python StudyInstanceUIDvi_metadata.py --input_file='../CathAI/data/DeepCORO/CATHAI_Extracted_Concatenated/DeepCORO_df_angle_object_dicom_2020_concat.csv' --destinationFolder='data3/' --dataFolder='data/' --data_type='ANGIO'
-
 
 DICOM_DICT = {
     "ANGIO": {
@@ -181,18 +175,22 @@ def process_metadata(metadata, data_type):
         processed_metadata["StudyInstanceUID"] = (
             processed_metadata["StudyInstanceUID"].astype(str).str.replace("'", "")
         )
-    print(processed_metadata.columns.tolist())
-    # Drop FrameTimeVector column
+    # Drop FrameTimeVector column if it exists
     if "FrameTimeVector" in processed_metadata.columns:
         processed_metadata = processed_metadata.drop(columns=["FrameTimeVector"])
-
-    # print(f"Processed metadata shape: {processed_metadata.shape}")
-    # print(f"Processed metadata columns: {processed_metadata.columns.tolist()}")
 
     return processed_metadata
 
 
 def convert_to_serializable(obj):
+    """
+    Safely convert various pydicom / numpy data types to standard Python
+    types that can be JSON-serialized. Extended to handle Sequences
+    and Datasets recursively.
+    """
+    from pydicom.dataset import Dataset as DicomDataset
+    from pydicom.sequence import Sequence as DicomSequence
+
     if isinstance(obj, (pydicom.multival.MultiValue, pydicom.valuerep.PersonName)):
         return str(obj)
     elif isinstance(obj, pydicom.valuerep.DSfloat):
@@ -209,6 +207,21 @@ def convert_to_serializable(obj):
         return float(obj)
     elif isinstance(obj, np.ndarray):
         return obj.tolist()
+    elif isinstance(obj, DicomSequence):
+        # Convert each Dataset in the Sequence
+        return [convert_to_serializable(ds) for ds in obj]
+    elif isinstance(obj, DicomDataset):
+        # Convert each DataElement in the Dataset
+        serial_dict = {}
+        for elem in obj.iterall():
+            if elem.keyword == "PixelData":
+                continue  # skip large pixel data
+            serial_dict[elem.keyword] = convert_to_serializable(elem.value)
+        return serial_dict
+    elif isinstance(obj, list):
+        return [convert_to_serializable(item) for item in obj]
+    elif isinstance(obj, dict):
+        return {k: convert_to_serializable(v) for k, v in obj.items()}
     return obj
 
 
@@ -216,38 +229,53 @@ def extract_h264_video_from_dicom(
     dicom_path, output_path, crf=23, preset="medium", data_type="ANGIO", lossless=False
 ):
     dicom_data = pydicom.dcmread(dicom_path)
+    if not hasattr(dicom_data, "PixelData"):
+        # Return None so we can skip or handle in process_row
+        print(f"[WARNING] No pixel data in file: {dicom_path}")
+        return None, {"file_path": dicom_path, "error": "No PixelData"}
     pixel_array = dicom_data.pixel_array
 
     # Determine fps
     frame_rate = 15  # default fps
+    # Update these tags if you need to check more possible frame rate attributes
     frame_rate_tags = [(0x08, 0x2144), (0x18, 0x1063), (0x18, 0x40), (0x7FDF, 0x1074)]
     for tag in frame_rate_tags:
         try:
             frame_rate = float(dicom_data[tag].value)
             break
         except (KeyError, AttributeError):
-            print(f"Frame rate tag {tag} not found in DICOM file {dicom_path}")
+            # You can comment this out to reduce verbosity
+            # print(f"Frame rate tag {tag} not found in DICOM file {dicom_path}")
             continue
+
+    # If it’s not ANGIO but we only found the default of 15, bump to 30 as a fallback
     if data_type != "ANGIO" and frame_rate == 15:
         frame_rate = 30
 
+    # Normalize to uint8 if needed
     if pixel_array.dtype != np.uint8:
         pixel_array = (
             (pixel_array - pixel_array.min()) / (pixel_array.max() - pixel_array.min()) * 255
         ).astype(np.uint8)
 
+    # Ensure pixel_array has at least 3 dims: (frames, height, width)
     if len(pixel_array.shape) == 2:
         pixel_array = np.expand_dims(pixel_array, axis=0)
 
-    is_color = pixel_array.shape[-1] == 3
+    is_color = len(pixel_array.shape) == 4 and pixel_array.shape[-1] == 3
 
     with tempfile.TemporaryDirectory() as temp_dir:
         for i, frame in enumerate(pixel_array):
             frame_path = os.path.join(temp_dir, f"frame_{i:04d}.png")
+            # If color, check channel arrangement
             if is_color:
-                frame = frame[..., ::-1]  # Convert BGR to RGB if color
-            cv2.imwrite(frame_path, frame)
+                # Sometimes it's BGR vs. RGB, adapt if needed.
+                # OpenCV typically uses BGR, so you may not need to flip channels here.
+                cv2.imwrite(frame_path, frame)
+            else:
+                cv2.imwrite(frame_path, frame)
 
+        # Lossless or CRF-based
         if lossless:
             ffmpeg_command = [
                 "ffmpeg",
@@ -287,7 +315,7 @@ def extract_h264_video_from_dicom(
             print(f"FFmpeg command failed: {e.stderr.strip()}")
             raise
 
-    # Extract DICOM metadata
+    # Extract DICOM metadata (excluding PixelData)
     dicom_dict = {
         elem.keyword: elem.value for elem in dicom_data.iterall() if elem.keyword != "PixelData"
     }
@@ -427,15 +455,12 @@ def convert_npz_batch_to_h264(
     process_args = []
     for _, row in input_df.iterrows():
         input_path = row[file_path_column]
-        # Preserve directory structure
+        # Example: preserve directory structure if needed
         rel_path = os.path.relpath(
             input_path, "/media/data1/ravram/CoronaryDominance/extracted_data/"
         )
         output_path = os.path.join(output_dir, rel_path).replace(".npz", ".mp4")
-        os.makedirs(
-            os.path.dirname(output_path), exist_ok=True
-        )  # Create output directory if it doesn't exist
-
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
         process_args.append((input_path, output_path, fps, crf, preset, lossless))
 
     # Process files in parallel
@@ -479,9 +504,11 @@ def extract_h264_and_metadata(
             df = pd.read_csv(path, sep=",")
         except pd.errors.EmptyDataError:
             df = pd.read_csv(path, sep="μ")
+
     if not os.path.exists(dataFolder):
         os.makedirs(dataFolder)
         print("Making output directory as it doesn't exist", dataFolder)
+
     fileName_1 = path.split("/")[-1]
     final_path = os.path.join(dataFolder, fileName_1 + "_metadata_extracted.csv")
     final_path_alpha = os.path.join(dataFolder, fileName_1 + "_metadata_extracted_alpha.csv")
@@ -508,12 +535,7 @@ def extract_h264_and_metadata(
         return None
 
     dicom_df_final = pd.DataFrame(final_list)
-    print("DataFrame created with shape:", dicom_df_final.shape)
-    print("DataFrame columns:", dicom_df_final.columns.tolist())
-
     dicom_df_final = process_metadata(dicom_df_final, data_type)
-    print("DataFrame after processing metadata:", dicom_df_final.shape)
-    print("Final DataFrame columns:", dicom_df_final.columns.tolist())
 
     dicom_df_final.to_csv(final_path, index=False)
     print(f"Metadata saved to: {final_path}")
@@ -559,7 +581,6 @@ def process_row(
     )
 
     # Convert metadata to serializable format
-
     serializable_metadata = {k: convert_to_serializable(v) for k, v in metadata.items()}
 
     # Add file and video_path to metadata if not already present
@@ -568,10 +589,8 @@ def process_row(
     if "video_path" not in serializable_metadata:
         serializable_metadata["video_path"] = output_path
 
-    # print(f"Processed DICOM: {dicom_path}")
-    # print(f"Metadata: {serializable_metadata}")
-
-    return json.dumps(serializable_metadata)  # Return serialized metadata
+    # Return a JSON string version
+    return json.dumps(serializable_metadata)
 
 
 def main(args=None):
