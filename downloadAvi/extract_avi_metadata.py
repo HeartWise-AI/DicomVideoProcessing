@@ -247,77 +247,51 @@ def extract_h264_video_from_dicom(
     import pydicom
 
     dicom_data = pydicom.dcmread(dicom_path)
+    
     # If no pixel data, skip
     if not hasattr(dicom_data, "PixelData"):
         print(f"[WARNING] No pixel data in file: {dicom_path}")
         return None, {"file_path": dicom_path, "error": "No PixelData"}
     pixel_array = dicom_data.pixel_array
 
-    # Determine fps
-    frame_rate = 15
-    frame_rate_tags = [(0x08, 0x2144), (0x18, 0x1063), (0x18, 0x40), (0x7FDF, 0x1074)]
-    for tag in frame_rate_tags:
-        try:
-            frame_rate = float(dicom_data[tag].value)
-            break
-        except (KeyError, AttributeError):
-            pass
-    if data_type != "ANGIO" and frame_rate == 15:
-        frame_rate = 30
+    # If pixel_array is not a 3D array, skip
+    if len(pixel_array.shape) != 3:
+        print(f"[WARNING] Not a movie: {dicom_path}")
+        return None, {"file_path": dicom_path, "error": "Not a movie"}
+    
+    # If no frame rate, skip
+    if not (0x08, 0x2144) in dicom_data:
+        print(f"[WARNING] No frame rate in DICOM: {dicom_path}")
+        return None, {"file_path": dicom_path, "error": "No frame rate in DICOM"}
 
-    # Normalize to uint8
-    if pixel_array.dtype != np.uint8:
-        pixel_array = (pixel_array - pixel_array.min()) / (pixel_array.max() - pixel_array.min())
-        pixel_array = (pixel_array * 255).astype(np.uint8)
+    # If frame rate is too low or video is too short, skip
+    frame_rate = dicom_data[(0x08, 0x2144)].value
+    # all dicom with a fps lower of 5 are bad
+    if frame_rate < 5 or frame_rate > pixel_array.shape[0]: # at least 1 second of video
+        print(f"[WARNING] Frame rate is too low: {frame_rate} with {pixel_array.shape[0]} frames for {dicom_path}")
+        return None, {"file_path": dicom_path, "error": "Frame rate is too low"}
 
-    if len(pixel_array.shape) == 2:
-        pixel_array = np.expand_dims(pixel_array, axis=0)
+    # Stretch pixel range to [0, 255]
+    pixel_array = pixel_array.astype(np.float32)
+    pixel_array = (pixel_array - pixel_array.min()) / (pixel_array.max() - pixel_array.min())
+    pixel_array = (pixel_array * 255).astype(np.uint8) # need to be uint8 for cv2
 
-    # Write frames as PNG
-    with tempfile.TemporaryDirectory() as temp_dir:
-        for i, frame in enumerate(pixel_array):
-            frame_path = os.path.join(temp_dir, f"frame_{i:04d}.png")
-            cv2.imwrite(frame_path, frame)
-
-        # Build ffmpeg command
-        if lossless:
-            ffmpeg_command = [
-                "ffmpeg",
-                "-framerate",
-                str(frame_rate),
-                "-i",
-                os.path.join(temp_dir, "frame_%04d.png"),
-                "-c:v",
-                "libx264",
-                "-preset",
-                "ultrafast",
-                "-qp",
-                "0",
-                "-y",
-                output_path,
-            ]
-        else:
-            ffmpeg_command = [
-                "ffmpeg",
-                "-framerate",
-                str(frame_rate),
-                "-i",
-                os.path.join(temp_dir, "frame_%04d.png"),
-                "-c:v",
-                "libx264",
-                "-crf",
-                str(crf),
-                "-preset",
-                preset,
-                "-y",
-                output_path,
-            ]
-
-        try:
-            subprocess.run(ffmpeg_command, check=True, capture_output=True, text=True)
-        except subprocess.CalledProcessError as e:
-            print(f"FFmpeg command failed: {e.stderr.strip()}")
-            raise
+    # Encode video as AVI
+    try:
+        fourcc = cv2.VideoWriter_fourcc(*'FFV1')  # FFV1 codec - lossless
+        out = cv2.VideoWriter(
+            output_path,
+            fourcc, 
+            frame_rate, 
+            (pixel_array.shape[1], pixel_array.shape[2]),
+            isColor=False # grayscale frames
+        )
+        for frame in pixel_array:
+            out.write(frame)
+        out.release()
+    except Exception as e:
+        print(f"Video encoding failed: {e}")
+        return None, {"file_path": dicom_path, "error": "Video encoding failed"}
 
     # Convert DICOM metadata to serializable dictionary, skipping large/binary fields
     dicom_dict = {}
@@ -501,16 +475,14 @@ def extract_h264_and_metadata(
     subdirectory=None,
     num_processes=None,
     lossless=False,
+    sep="α"
 ):
     from tqdm import tqdm
 
     try:
-        df = pd.read_csv(path, sep="α", engine="python")
+        df = pd.read_csv(path, sep=sep, engine="python")
     except pd.errors.EmptyDataError:
-        try:
-            df = pd.read_csv(path, sep=",")
-        except pd.errors.EmptyDataError:
-            df = pd.read_csv(path, sep="μ")
+        raise ValueError(f"Empty data in {path}")
 
     if not os.path.exists(dataFolder):
         os.makedirs(dataFolder)
@@ -532,7 +504,7 @@ def extract_h264_and_metadata(
             process_row,
             [
                 (row, destinationFolder, subdirectory, dicom_path_column, data_type, lossless)
-                for _, row in tqdm(df.iterrows())
+                for _, row in tqdm(df.iterrows(), desc="Preprocessing rows", total=len(df))
             ],
         )
     final_list = [json.loads(result) for result in results if result is not None]
@@ -592,7 +564,7 @@ def process_row(
                 f"Column '{dicom_path_column}' not found in row. Available columns: {list(row.index)}"
             )
 
-    output_filename = os.path.basename(dicom_path).replace(".dcm", ".mp4")
+    output_filename = os.path.basename(dicom_path).replace(".dcm", ".avi")
     output_path = os.path.join(destinationPath, output_filename)
 
     # Extract H.264 video and get metadata
@@ -633,6 +605,12 @@ def main(args=None):
         required=True,
         help="Column name containing file paths (DICOM or NPZ)",
     )
+    parser.add_argument(
+        "--sep",
+        required=False,
+        default="α",
+        help="Separator for the input file (default: α)",
+    )
 
     # Output arguments
     parser.add_argument(
@@ -662,6 +640,7 @@ def main(args=None):
     print(f"File path column: {args.file_path_column}")
     print(f"Output directory: {args.output_dir}")
     print(f"Lossless compression: {args.lossless}")
+    print(f"Separator: {args.sep}")
 
     if args.file_type == "dicom":
         extract_h264_and_metadata(
@@ -673,6 +652,7 @@ def main(args=None):
             dataFolder=args.metadata_dir,
             num_processes=args.num_processes,
             lossless=args.lossless,
+            sep=args.sep
         )
     else:  # npz
         df = pd.read_csv(args.input_file)
