@@ -15,6 +15,7 @@ import cv2
 import numpy as np
 import pandas as pd
 import pydicom
+from pydicom.pixel_data_handlers.util import apply_color_lut
 from pydicom.uid import UID, generate_uid
 from tqdm import tqdm
 
@@ -257,14 +258,17 @@ def extract_h264_video_from_dicom(
     photo_type = getattr(ds, "PhotometricInterpretation", "MONOCHROME2")
     pixel_array = ds.pixel_array
 
-    # Organize frames depending on the shape of pixel_array
-    if pixel_array.ndim == 2:
+    # Determine if the image is multi-frame:
+    # - If the array is 3D and the last dimension is 3, treat it as a single RGB image.
+    # - Otherwise, if a NumberOfFrames attribute exists and > 1, treat it as multi-frame.
+    if pixel_array.ndim == 3 and pixel_array.shape[-1] == 3:
         frames = [pixel_array]
-    elif pixel_array.ndim in (3, 4):
-        # For 3D arrays, assume first dimension is frame count.
-        frames = [frame for frame in pixel_array]
     else:
-        frames = [pixel_array]
+        num_frames = int(getattr(ds, "NumberOfFrames", 1))
+        if num_frames <= 1:
+            frames = [pixel_array]
+        else:
+            frames = [frame for frame in pixel_array]
 
     processed_frames = []
     for frame in frames:
@@ -275,15 +279,16 @@ def extract_h264_video_from_dicom(
             else:
                 proc = cv2.cvtColor(frame[..., 0], cv2.COLOR_GRAY2BGR)
         elif photo_type == "PALETTE COLOR":
-            try:
-                red_desc = ds[0x0028, 0x1101].value  # e.g., [256, 0, 16]
-            except KeyError:
-                print(f"[WARNING] No LUT descriptor for PALETTE COLOR in {dicom_path}")
-                continue
+            # Retrieve the LUT descriptor (e.g., [256, 0, 16])
+            red_desc = ds[0x0028, 0x1101].value
             n_entries, first_index, bits = red_desc
+
+            # Convert the LUT bytes to numpy arrays using frombuffer
             red_lut = np.frombuffer(ds[0x0028, 0x1201].value, dtype=np.uint16)[:n_entries]
             green_lut = np.frombuffer(ds[0x0028, 0x1202].value, dtype=np.uint16)[:n_entries]
             blue_lut = np.frombuffer(ds[0x0028, 0x1203].value, dtype=np.uint16)[:n_entries]
+
+            # Scale LUT values to 8-bit if needed
             if bits > 8:
                 factor = 2 ** (bits - 8)
                 red_lut = (red_lut / factor).astype(np.uint8)
@@ -293,13 +298,26 @@ def extract_h264_video_from_dicom(
                 red_lut = red_lut.astype(np.uint8)
                 green_lut = green_lut.astype(np.uint8)
                 blue_lut = blue_lut.astype(np.uint8)
+
+            # Create a combined LUT (shape: [n_entries, 3])
             lut = np.stack((red_lut, green_lut, blue_lut), axis=-1)
-            proc = lut[frame - first_index]
+
+            # Map the pixel indices to RGB values (adjust for first_index)
+            try:
+                proc = lut[frame - first_index]
+                # Convert from RGB -> BGR for correct OpenCV saving FIXES BLUE VIDEO
+                proc = proc[..., ::-1]
+            except Exception as e:
+                print(f"[WARNING] Palette color mapping failed for {dicom_path} with error: {e}")
+                proc = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)  # fallback to grayscale
         elif photo_type == "RGB":
             if frame.ndim == 2:
                 proc = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
             elif frame.ndim == 3:
+                # Suppose this results in an RGB array ...
                 proc = frame if frame.shape[-1] == 3 else np.transpose(frame, (1, 2, 0))
+                # Then flip to BGR:
+                proc = proc[..., ::-1]
             else:
                 proc = frame
         elif photo_type in ("YBR_FULL", "YBR_FULL_422"):
@@ -324,7 +342,7 @@ def extract_h264_video_from_dicom(
             proc = cv2.normalize(proc, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
         processed_frames.append(proc)
 
-    # If only one frame, save as PNG; otherwise, build video from frames.
+    # If only one frame (screenshot), save as PNG; otherwise, build video from frames.
     if len(processed_frames) == 1:
         output_file = output_path.replace(".mp4", ".png")
         cv2.imwrite(output_file, processed_frames[0])
@@ -526,18 +544,22 @@ def extract_h264_and_metadata(
             df = pd.read_csv(path, sep=",")
         except pd.errors.EmptyDataError:
             df = pd.read_csv(path, sep="μ")
+
     if not os.path.exists(dataFolder):
         os.makedirs(dataFolder)
         print("Making output directory as it doesn't exist", dataFolder)
+
     fileName_1 = path.split("/")[-1]
     final_path = os.path.join(dataFolder, fileName_1 + "_metadata_extracted.csv")
     final_path_alpha = os.path.join(dataFolder, fileName_1 + "_metadata_extracted_alpha.csv")
+
+    existing_df = None
     if os.path.exists(final_path):
-        raise FileExistsError(
-            f"The file {final_path} already exists and cannot be created again."
-        )
+        existing_df = pd.read_csv(final_path)
+
     if num_processes is None:
         num_processes = multiprocessing.cpu_count()
+
     with multiprocessing.Pool(processes=num_processes) as pool:
         results = pool.starmap(
             process_row,
@@ -546,20 +568,30 @@ def extract_h264_and_metadata(
                 for _, row in tqdm(df.iterrows())
             ],
         )
+
     final_list = [json.loads(result) for result in results if result is not None]
     if not final_list:
         print("No valid results were returned from processing.")
         return None
+
     dicom_df_final = pd.DataFrame(final_list)
     dicom_df_final = process_metadata(dicom_df_final, data_type)
+
+    if existing_df is not None:
+        # Combine existing and new data, keeping last occurrence of duplicates
+        combined_df = pd.concat([existing_df, dicom_df_final])
+        dicom_df_final = combined_df.drop_duplicates(subset=["FileName"], keep="last")
+
     dicom_df_final.to_csv(final_path, index=False)
     print(f"Metadata saved to: {final_path}")
+
     with open(final_path) as csvfile, open(final_path_alpha, "w", newline="") as alphafile:
         reader = csv.reader(csvfile)
         writer = csv.writer(alphafile, delimiter="α")
         for row in reader:
             writer.writerow(row)
     print(f"Alpha-delimited metadata saved to: {final_path_alpha}")
+
     return dicom_df_final
 
 
@@ -583,14 +615,20 @@ def process_row(
     try:
         dicom_path = os.path.join(row[dicom_path_column])
     except KeyError:
+        # First try case-insensitive match
         if dicom_path_column.lower() in [col.lower() for col in row.index]:
             actual_col = next(
                 col for col in row.index if col.lower() == dicom_path_column.lower()
             )
             dicom_path = os.path.join(row[actual_col])
+        # Then try 'DICOM File Path' as a fallback
+        elif "DICOM File Path" in row.index:
+            dicom_path = os.path.join(row["DICOM File Path"])
+        # Finally raise error with available columns
         else:
+            available_cols = sorted(list(row.index))
             raise KeyError(
-                f"Column '{dicom_path_column}' not found in row. Available columns: {list(row.index)}"
+                f"Column '{dicom_path_column}' not found in row and 'DICOM File Path' not found. Available columns: {available_cols}"
             )
     output_filename = os.path.basename(dicom_path).replace(".dcm", ".mp4")
     output_path = os.path.join(destinationPath, output_filename)
