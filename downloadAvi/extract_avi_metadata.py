@@ -27,8 +27,8 @@ DICOM_DICT = {
         "(0008, 2144)": "FPS",
         "(0028, 0008)": "NumberOfFrames",
         "(0008, 0020)": "date",
-        "(0008, 0030)": "study_time",
-        "(0008, 0031)": "series_time",
+        "(0008, 0030)": "StudyTime",
+        "(0008, 0031)": "SeriesTime",
         "(0010, 0030)": "birthdate",
         "(0028, 0004)": "color_format",
         "(0010, 0020)": "mrn",
@@ -482,6 +482,31 @@ def _convert_npz_worker(args):
         }
 
 
+def format_time_column(df, column_name):
+    """
+    Formats a time column from HHMMSS.decimal or HHMMSS format to HH:MM:SS time format and overwrites the original column.
+
+    Parameters:
+    - df: pandas DataFrame containing the column to format.
+    - column_name: string, name of the column in the DataFrame to format.
+
+    The function directly modifies the input DataFrame by updating the specified time column to the HH:MM:SS format.
+    """
+    # Convert the column to string to ensure manipulation is possible
+    df[column_name] = df[column_name].astype(str)
+
+    # Remove decimals and any digits following (if present) to ensure a strict HHMMSS format
+    no_decimals = (
+        df[column_name].str.split(".").str[0].str.pad(width=6, side="left", fillchar="0")
+    )
+
+    # Convert to a proper time format (HH:MM:SS), handling errors with 'coerce' to avoid crashes on unexpected formats
+    formatted_time = pd.to_datetime(no_decimals, format="%H%M%S", errors="coerce").dt.time
+
+    # Overwrite the original column with the formatted time
+    df[column_name] = formatted_time
+
+
 def convert_npz_batch_to_h264(
     input_df,
     file_path_column,
@@ -521,6 +546,7 @@ def convert_npz_batch_to_h264(
     metadata_df["input_path"] = [args[0] for args in process_args]
     metadata_df["output_path"] = [args[1] for args in process_args]
     metadata_path = os.path.join(output_dir, "conversion_metadata.csv")
+
     metadata_df.to_csv(metadata_path, index=False)
     return metadata_df
 
@@ -576,6 +602,12 @@ def extract_h264_and_metadata(
 
     dicom_df_final = pd.DataFrame(final_list)
     dicom_df_final = process_metadata(dicom_df_final, data_type)
+
+    # Format time columns if they exist
+    if "SeriesTime" in dicom_df_final.columns:
+        format_time_column(dicom_df_final, "SeriesTime")
+    if "StudyTime" in dicom_df_final.columns:
+        format_time_column(dicom_df_final, "StudyTime")
 
     if existing_df is not None:
         # Combine existing and new data, keeping last occurrence of duplicates
