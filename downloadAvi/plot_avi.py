@@ -34,8 +34,7 @@ def sample_and_plot_middle_frames(
     Returns:
         None
     """
-
-    sampled_filenames = df[path_column].sample(N, replace=True)
+    sampled_filenames = df[path_column].sample(N, replace=len(df) < N)
 
     # Calculate rows & cols for subplots
     num_rows = (N + 4) // 5
