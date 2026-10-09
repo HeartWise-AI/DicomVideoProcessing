@@ -1,5 +1,9 @@
-# Notebook which iterates through a folder, including subfolders,
-# and convert DICOM files to AVI files
+#!/usr/bin/env python
+"""
+Notebook which iterates through a folder, including subfolders,
+and converts DICOM files to AVI videos or PNG images, and NPZ files to MP4 videos.
+"""
+
 import csv
 import json
 import multiprocessing
@@ -11,6 +15,7 @@ import cv2
 import numpy as np
 import pandas as pd
 import pydicom
+from pydicom.pixel_data_handlers.util import apply_color_lut
 from pydicom.uid import UID, generate_uid
 from tqdm import tqdm
 
@@ -22,8 +27,8 @@ DICOM_DICT = {
         "(0008, 2144)": "FPS",
         "(0028, 0008)": "NumberOfFrames",
         "(0008, 0020)": "date",
-        "(0008, 0030)": "study_time",
-        "(0008, 0031)": "series_time",
+        "(0008, 0030)": "StudyTime",
+        "(0008, 0031)": "SeriesTime",
         "(0010, 0030)": "birthdate",
         "(0028, 0004)": "color_format",
         "(0010, 0020)": "mrn",
@@ -71,7 +76,7 @@ DICOM_DICT = {
         "(0020, 000d)": "StudyInstanceUID",
         "(0020, 000e)": "SeriesInstanceUID",
         "file": "dicom_path",
-        "video_path": "FileName",
+        "video_path": "video_path",
     },
 }
 
@@ -94,7 +99,6 @@ def convert_to_serializable(obj, max_length=5000):
     elif isinstance(obj, pydicom.uid.UID):
         return str(obj)
     elif isinstance(obj, bytes):
-        # If it's large (e.g., waveforms), skip or truncate
         if len(obj) > max_length:
             return f"<binary data, length={len(obj)} truncated>"
         try:
@@ -106,7 +110,6 @@ def convert_to_serializable(obj, max_length=5000):
     elif isinstance(obj, np.floating):
         return float(obj)
     elif isinstance(obj, np.ndarray):
-        # If array is large, truncate
         if obj.size > max_length:
             return f"<large ndarray, shape={obj.shape}, dtype={obj.dtype}>"
         else:
@@ -114,14 +117,11 @@ def convert_to_serializable(obj, max_length=5000):
     elif isinstance(obj, DicomSequence):
         return [convert_to_serializable(ds, max_length) for ds in obj]
     elif isinstance(obj, DicomDataset):
-        # Convert each element except PixelData, CurveData, or waveforms
         serial_dict = {}
         for elem in obj.iterall():
             tag_str = f"({elem.tag.group:04x}, {elem.tag.element:04x})"
-            # Skip PixelData or giant waveforms
             if elem.keyword in ["PixelData", "WaveformData", "CurveData"]:
                 continue
-            # Some curve data or large binary arrays
             if tag_str in ["(5000, 3000)", "(7fe0, 0010)"]:
                 continue
             serial_dict[elem.keyword] = convert_to_serializable(elem.value, max_length)
@@ -140,19 +140,16 @@ def mask_and_crop(movie):
     diff_mov = np.diff(sum_channel_mov, axis=0)
     mask = np.sum(diff_mov.astype(bool), axis=0) > 10
 
-    # erosion, followed by dilation to remove ecg traces touching cone
     selem = morphology.selem.disk(5)
     eroded = morphology.erosion(mask, selem)
     dilated = morphology.dilation(eroded, selem)
 
-    # make mask 3-channel for more vectorized multiplication
     mask_3channel = np.zeros([dilated.shape[0], dilated.shape[1], 3])
     mask_3channel[:, :, 0] = dilated
     mask_3channel[:, :, 1] = dilated
     mask_3channel[:, :, 2] = dilated
     mask_3channel = mask_3channel.astype(bool)
 
-    # get size of cropped movie
     x_locations = np.max(dilated, axis=0)
     y_locations = np.max(dilated, axis=1)
     left = np.where(x_locations)[0][0]
@@ -162,19 +159,16 @@ def mask_and_crop(movie):
     h = bottom - top
     w = right - left
 
-    # padding length for frame in x and y in case crop is beyond image boundaries
     pad = int(max([h, w]) / 2)
     x_center = right - int(w / 2) + pad
     y_center = bottom - int(h / 2) + pad
 
-    # height and width of new frames
     size = int(max([h, w]) / 2) * 2
     crop_left = int(x_center - (size / 2))
     crop_right = int(x_center + (size / 2))
     crop_top = int(y_center - (size / 2))
     crop_bottom = int(y_center + (size / 2))
 
-    # multiply each frame by mask, pad, and center crop
     masked_movie = movie
     out_movie = np.zeros([movie.shape[0], size, size, movie.shape[3]], dtype="uint8")
     for frame in range(movie.shape[0]):
@@ -192,14 +186,10 @@ def mask_and_crop(movie):
 def process_metadata(metadata, data_type):
     tag_map = DICOM_DICT[data_type]
 
-    # Convert metadata to DataFrame if it's not already
     if not isinstance(metadata, pd.DataFrame):
         metadata = pd.DataFrame([metadata])
 
-    # Create a new DataFrame with all original columns
     processed_metadata = metadata.copy()
-
-    # Rename columns based on tag_map
     rename_dict = {}
     for tag, col_name in tag_map.items():
         if tag in metadata.columns:
@@ -221,19 +211,16 @@ def process_metadata(metadata, data_type):
 
     processed_metadata.rename(columns=rename_dict, inplace=True)
 
-    # Handle FPS
     if "FPS" in processed_metadata.columns and processed_metadata["FPS"].isna().all():
         if "RecommendedDisplayFrameRate" in processed_metadata.columns:
             processed_metadata["FPS"] = processed_metadata["RecommendedDisplayFrameRate"]
         else:
-            processed_metadata["FPS"] = 1.0  # default value
+            processed_metadata["FPS"] = 1.0
 
-    # Handle StudyInstanceUID
     if "StudyInstanceUID" in processed_metadata.columns:
         processed_metadata["StudyInstanceUID"] = (
             processed_metadata["StudyInstanceUID"].astype(str).str.replace("'", "")
         )
-    # Drop FrameTimeVector column if it exists
     if "FrameTimeVector" in processed_metadata.columns:
         processed_metadata = processed_metadata.drop(columns=["FrameTimeVector"])
 
@@ -243,73 +230,170 @@ def process_metadata(metadata, data_type):
 def extract_h264_video_from_dicom(
     dicom_path, output_path, crf=23, preset="medium", data_type="ANGIO", lossless=False
 ):
-    """Read DICOM, extract frames to PNG, then encode H.264 with FFmpeg. Return metadata (minus large fields)."""
+    """
+    Read a DICOM file, process its pixel data according to its Photometric Interpretation,
+    and then save as an FFV1 AVI video (if multi-frame) or PNG image (if single-frame).
+    Returns the output file path and serializable metadata.
+    """
     import pydicom
 
-    dicom_data = pydicom.dcmread(dicom_path)
-    
-    # If no pixel data, skip
-    if not hasattr(dicom_data, "PixelData"):
+    ds = pydicom.dcmread(dicom_path)
+    if not hasattr(ds, "PixelData"):
         print(f"[WARNING] No pixel data in file: {dicom_path}")
         return None, {"file_path": dicom_path, "error": "No PixelData"}
-    pixel_array = dicom_data.pixel_array
 
-    # If pixel_array is not a 3D array, skip
-    if len(pixel_array.shape) != 3:
-        print(f"[WARNING] Not a movie: {dicom_path}")
-        return None, {"file_path": dicom_path, "error": "Not a movie"}
-    
-    # If no frame rate, skip
-    if not (0x08, 0x2144) in dicom_data:
-        print(f"[WARNING] No frame rate in DICOM: {dicom_path}")
-        return None, {"file_path": dicom_path, "error": "No frame rate in DICOM"}
+    # Determine frame rate from several possible tags
+    frame_rate = 15
+    frame_rate_tags = [(0x08, 0x2144), (0x18, 0x1063), (0x18, 0x40), (0x7FDF, 0x1074)]
+    for tag in frame_rate_tags:
+        try:
+            frame_rate = float(ds[tag].value)
+            break
+        except (KeyError, AttributeError):
+            pass
+    if data_type != "ANGIO" and frame_rate == 15:
+        frame_rate = 30
 
-    # If frame rate is too low or video is too short, skip
-    frame_rate = dicom_data[(0x08, 0x2144)].value
-    # all dicom with a fps lower of 5 are bad
-    if frame_rate < 5 or frame_rate > pixel_array.shape[0]: # at least 1 second of video
-        print(f"[WARNING] Frame rate is too low: {frame_rate} with {pixel_array.shape[0]} frames for {dicom_path}")
-        return None, {"file_path": dicom_path, "error": "Frame rate is too low"}
+    # Get photometric interpretation (defaulting to MONOCHROME2)
+    photo_type = getattr(ds, "PhotometricInterpretation", "MONOCHROME2")
+    pixel_array = ds.pixel_array
 
-    # Stretch pixel range to [0, 255]
-    pixel_array = pixel_array.astype(np.float32)
-    pixel_array = (pixel_array - pixel_array.min()) / (pixel_array.max() - pixel_array.min())
-    pixel_array = (pixel_array * 255).astype(np.uint8) # need to be uint8 for cv2
+    # Determine if the image is multi-frame:
+    # - If the array is 3D and the last dimension is 3, treat it as a single RGB image.
+    # - Otherwise, if a NumberOfFrames attribute exists and > 1, treat it as multi-frame.
+    if pixel_array.ndim == 3 and pixel_array.shape[-1] == 3:
+        frames = [pixel_array]
+    else:
+        num_frames = int(getattr(ds, "NumberOfFrames", 1))
+        if num_frames <= 1:
+            frames = [pixel_array]
+        else:
+            frames = [frame for frame in pixel_array]
 
-    # Encode video as AVI
-    try:
-        fourcc = cv2.VideoWriter_fourcc(*'FFV1')  # FFV1 codec - lossless
-        out = cv2.VideoWriter(
-            output_path,
-            fourcc, 
-            frame_rate, 
-            (pixel_array.shape[1], pixel_array.shape[2]),
-            isColor=False # grayscale frames
-        )
-        for frame in pixel_array:
-            out.write(frame)
-        out.release()
-    except Exception as e:
-        print(f"Video encoding failed: {e}")
-        return None, {"file_path": dicom_path, "error": "Video encoding failed"}
+    # Keep the angiography cine checks; screenshots and TTE use the paths above.
+    if data_type == "ANGIO" and len(frames) > 1:
+        if (0x08, 0x2144) not in ds:
+            print(f"[WARNING] No frame rate in DICOM: {dicom_path}")
+            return None, {"file_path": dicom_path, "error": "No frame rate in DICOM"}
+        if frame_rate < 5 or frame_rate > len(frames):
+            print(f"[WARNING] Invalid cine frame rate or duration: {dicom_path}")
+            return None, {"file_path": dicom_path, "error": "Frame rate is too low"}
 
-    # Convert DICOM metadata to serializable dictionary, skipping large/binary fields
+    processed_frames = []
+    for frame in frames:
+        if photo_type == "MONOCHROME2":
+            # For grayscale, convert to 3-channel image.
+            if frame.ndim == 2:
+                proc = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+            else:
+                proc = cv2.cvtColor(frame[..., 0], cv2.COLOR_GRAY2BGR)
+        elif photo_type == "PALETTE COLOR":
+            # Retrieve the LUT descriptor (e.g., [256, 0, 16])
+            red_desc = ds[0x0028, 0x1101].value
+            n_entries, first_index, bits = red_desc
+
+            # Convert the LUT bytes to numpy arrays using frombuffer
+            red_lut = np.frombuffer(ds[0x0028, 0x1201].value, dtype=np.uint16)[:n_entries]
+            green_lut = np.frombuffer(ds[0x0028, 0x1202].value, dtype=np.uint16)[:n_entries]
+            blue_lut = np.frombuffer(ds[0x0028, 0x1203].value, dtype=np.uint16)[:n_entries]
+
+            # Scale LUT values to 8-bit if needed
+            if bits > 8:
+                factor = 2 ** (bits - 8)
+                red_lut = (red_lut / factor).astype(np.uint8)
+                green_lut = (green_lut / factor).astype(np.uint8)
+                blue_lut = (blue_lut / factor).astype(np.uint8)
+            else:
+                red_lut = red_lut.astype(np.uint8)
+                green_lut = green_lut.astype(np.uint8)
+                blue_lut = blue_lut.astype(np.uint8)
+
+            # Create a combined LUT (shape: [n_entries, 3])
+            lut = np.stack((red_lut, green_lut, blue_lut), axis=-1)
+
+            # Map the pixel indices to RGB values (adjust for first_index)
+            try:
+                proc = lut[frame - first_index]
+                # Convert from RGB -> BGR for correct OpenCV saving FIXES BLUE VIDEO
+                proc = proc[..., ::-1]
+            except Exception as e:
+                print(f"[WARNING] Palette color mapping failed for {dicom_path} with error: {e}")
+                proc = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)  # fallback to grayscale
+        elif photo_type == "RGB":
+            if frame.ndim == 2:
+                proc = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+            elif frame.ndim == 3:
+                # Suppose this results in an RGB array ...
+                proc = frame if frame.shape[-1] == 3 else np.transpose(frame, (1, 2, 0))
+                # Then flip to BGR:
+                proc = proc[..., ::-1]
+            else:
+                proc = frame
+        elif photo_type in ("YBR_FULL", "YBR_FULL_422"):
+            if frame.ndim == 2:
+                proc = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+            elif frame.ndim == 3:
+                proc = frame if frame.shape[-1] == 3 else np.transpose(frame, (1, 2, 0))
+            else:
+                proc = frame
+            try:
+                proc = cv2.cvtColor(proc, cv2.COLOR_YCrCb2BGR)
+            except Exception as e:
+                print(f"[WARNING] Error converting YBR image: {e}")
+        else:
+            # Default: assume grayscale
+            if frame.ndim == 2:
+                proc = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+            else:
+                proc = frame
+
+        if proc.dtype != np.uint8:
+            proc = cv2.normalize(proc, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        processed_frames.append(proc)
+
+    # If only one frame (screenshot), save as PNG; otherwise, encode lossless AVI.
+    if len(processed_frames) == 1:
+        output_file = os.path.splitext(output_path)[0] + ".png"
+        if not cv2.imwrite(output_file, processed_frames[0]):
+            return None, {"file_path": dicom_path, "error": "PNG encoding failed"}
+    else:
+        output_file = os.path.splitext(output_path)[0] + ".avi"
+        out = None
+        try:
+            height, width = processed_frames[0].shape[:2]
+            out = cv2.VideoWriter(
+                output_file,
+                cv2.VideoWriter_fourcc(*"FFV1"),
+                frame_rate,
+                (width, height),
+                isColor=processed_frames[0].ndim == 3,
+            )
+            if not out.isOpened():
+                raise RuntimeError("FFV1 video writer could not be opened")
+            for frame in processed_frames:
+                out.write(frame)
+        except Exception as e:
+            print(f"Video encoding failed: {e}")
+            return None, {"file_path": dicom_path, "error": "Video encoding failed"}
+        finally:
+            if out is not None:
+                out.release()
+
+    # Convert metadata (excluding large binary fields) to a serializable dict.
     dicom_dict = {}
-    for elem in dicom_data.iterall():
+    for elem in ds.iterall():
         if elem.keyword not in ["PixelData", "WaveformData", "CurveData"]:
             tag_str = f"({elem.tag.group:04x}, {elem.tag.element:04x})"
             if tag_str not in ["(5000, 3000)", "(7fe0, 0010)"]:
                 dicom_dict[elem.keyword] = convert_to_serializable(elem.value)
-
-    dicom_dict["video_path"] = output_path
-    return output_path, dicom_dict
+    dicom_dict["video_path"] = output_file
+    return output_file, dicom_dict
 
 
 def _convert_npz_worker(args):
-    """Worker function for parallel processing"""
+    """Worker function for parallel NPZ processing."""
     input_path, output_path, fps, crf, preset, lossless = args
     try:
-        # Load NPZ file
         data = np.load(input_path)
         if "pixel_array" not in data:
             return {
@@ -318,26 +402,16 @@ def _convert_npz_worker(args):
                 "status": "error",
                 "error_message": "No pixel_array found",
             }
-
         pixel_array = data["pixel_array"]
-
-        # Ensure output directory exists
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
-
-        # Normalize pixel values to uint8 if needed
         if pixel_array.dtype != np.uint8:
             pixel_array = (
                 (pixel_array - pixel_array.min()) * 255 / (pixel_array.max() - pixel_array.min())
             ).astype(np.uint8)
-
-        # Create temporary directory for frames
         with tempfile.TemporaryDirectory() as temp_dir:
-            # Save frames as temporary PNG files
             for i, frame in enumerate(pixel_array):
                 frame_path = os.path.join(temp_dir, f"frame_{i:04d}.png")
                 cv2.imwrite(frame_path, frame)
-
-            # Construct FFmpeg command
             if lossless:
                 ffmpeg_command = [
                     "ffmpeg",
@@ -370,8 +444,6 @@ def _convert_npz_worker(args):
                     "-y",
                     output_path,
                 ]
-
-            # Run FFmpeg
             result = subprocess.run(ffmpeg_command, capture_output=True, text=True)
             if result.returncode != 0:
                 return {
@@ -380,7 +452,6 @@ def _convert_npz_worker(args):
                     "status": "error",
                     "error_message": result.stderr,
                 }
-
         return {
             "input_file": input_path,
             "output_file": output_path,
@@ -391,7 +462,6 @@ def _convert_npz_worker(args):
             "status": "success",
             "error_message": "",
         }
-
     except Exception as e:
         return {
             "input_file": input_path,
@@ -399,6 +469,31 @@ def _convert_npz_worker(args):
             "status": "error",
             "error_message": str(e),
         }
+
+
+def format_time_column(df, column_name):
+    """
+    Formats a time column from HHMMSS.decimal or HHMMSS format to HH:MM:SS time format and overwrites the original column.
+
+    Parameters:
+    - df: pandas DataFrame containing the column to format.
+    - column_name: string, name of the column in the DataFrame to format.
+
+    The function directly modifies the input DataFrame by updating the specified time column to the HH:MM:SS format.
+    """
+    # Convert the column to string to ensure manipulation is possible
+    df[column_name] = df[column_name].astype(str)
+
+    # Remove decimals and any digits following (if present) to ensure a strict HHMMSS format
+    no_decimals = (
+        df[column_name].str.split(".").str[0].str.pad(width=6, side="left", fillchar="0")
+    )
+
+    # Convert to a proper time format (HH:MM:SS), handling errors with 'coerce' to avoid crashes on unexpected formats
+    formatted_time = pd.to_datetime(no_decimals, format="%H%M%S", errors="coerce").dt.time
+
+    # Overwrite the original column with the formatted time
+    df[column_name] = formatted_time
 
 
 def convert_npz_batch_to_h264(
@@ -413,38 +508,21 @@ def convert_npz_batch_to_h264(
 ):
     """
     Convert batch of NPZ files to H.264 videos in parallel.
-
-    Args:
-        input_df (pd.DataFrame): DataFrame containing file paths
-        file_path_column (str): Name of column containing NPZ file paths
-        output_dir (str): Directory to save output videos
-        fps (int): Frames per second for output videos
-        crf (int): Constant Rate Factor for H.264 compression
-        preset (str): FFmpeg preset
-        lossless (bool): Whether to use lossless compression
-        num_processes (int): Number of parallel processes to use
     """
     if file_path_column not in input_df.columns:
         raise ValueError(f"Column '{file_path_column}' not found in input DataFrame")
-
     os.makedirs(output_dir, exist_ok=True)
-
     if num_processes is None:
         num_processes = multiprocessing.cpu_count()
-
-    # Prepare arguments for parallel processing
     process_args = []
     for _, row in input_df.iterrows():
         input_path = row[file_path_column]
-        # Example: preserve directory structure if needed
         rel_path = os.path.relpath(
             input_path, "/media/data1/ravram/CoronaryDominance/extracted_data/"
         )
         output_path = os.path.join(output_dir, rel_path).replace(".npz", ".mp4")
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         process_args.append((input_path, output_path, fps, crf, preset, lossless))
-
-    # Process files in parallel
     with multiprocessing.Pool(processes=num_processes) as pool:
         results = list(
             tqdm(
@@ -453,15 +531,11 @@ def convert_npz_batch_to_h264(
                 desc="Converting NPZ files",
             )
         )
-
-    # Create metadata DataFrame
     metadata_df = pd.DataFrame(results)
-
-    # Add input and output paths to metadata
     metadata_df["input_path"] = [args[0] for args in process_args]
     metadata_df["output_path"] = [args[1] for args in process_args]
-
     metadata_path = os.path.join(output_dir, "conversion_metadata.csv")
+
     metadata_df.to_csv(metadata_path, index=False)
     return metadata_df
 
@@ -481,8 +555,8 @@ def extract_h264_and_metadata(
 
     try:
         df = pd.read_csv(path, sep=sep, engine="python")
-    except pd.errors.EmptyDataError:
-        raise ValueError(f"Empty data in {path}")
+    except pd.errors.EmptyDataError as e:
+        raise ValueError(f"Empty data in {path}") from e
 
     if not os.path.exists(dataFolder):
         os.makedirs(dataFolder)
@@ -491,10 +565,10 @@ def extract_h264_and_metadata(
     fileName_1 = path.split("/")[-1]
     final_path = os.path.join(dataFolder, fileName_1 + "_metadata_extracted.csv")
     final_path_alpha = os.path.join(dataFolder, fileName_1 + "_metadata_extracted_alpha.csv")
+
+    existing_df = None
     if os.path.exists(final_path):
-        raise FileExistsError(
-            f"The file {final_path} already exists and cannot be created again."
-        )
+        existing_df = pd.read_csv(final_path)
 
     if num_processes is None:
         num_processes = multiprocessing.cpu_count()
@@ -507,8 +581,8 @@ def extract_h264_and_metadata(
                 for _, row in tqdm(df.iterrows(), desc="Preprocessing rows", total=len(df))
             ],
         )
-    final_list = [json.loads(result) for result in results if result is not None]
 
+    final_list = [json.loads(result) for result in results if result is not None]
     if not final_list:
         print("No valid results were returned from processing.")
         return None
@@ -516,16 +590,25 @@ def extract_h264_and_metadata(
     dicom_df_final = pd.DataFrame(final_list)
     dicom_df_final = process_metadata(dicom_df_final, data_type)
 
+    # Format time columns if they exist
+    if "SeriesTime" in dicom_df_final.columns:
+        format_time_column(dicom_df_final, "SeriesTime")
+    if "StudyTime" in dicom_df_final.columns:
+        format_time_column(dicom_df_final, "StudyTime")
+
+    if existing_df is not None:
+        # Combine existing and new data, keeping last occurrence of duplicates
+        combined_df = pd.concat([existing_df, dicom_df_final])
+        dicom_df_final = combined_df.drop_duplicates(subset=["FileName"], keep="last")
+
     dicom_df_final.to_csv(final_path, index=False)
     print(f"Metadata saved to: {final_path}")
 
-    # Write alpha-delimited file
     with open(final_path) as csvfile, open(final_path_alpha, "w", newline="") as alphafile:
         reader = csv.reader(csvfile)
         writer = csv.writer(alphafile, delimiter="α")
         for row in reader:
             writer.writerow(row)
-
     print(f"Alpha-delimited metadata saved to: {final_path_alpha}")
 
     return dicom_df_final
@@ -544,7 +627,6 @@ def process_row(
             )
     else:
         destinationPath = destinationFolder
-
     try:
         os.makedirs(destinationPath, exist_ok=True)
     except Exception as e:
@@ -552,36 +634,32 @@ def process_row(
     try:
         dicom_path = os.path.join(row[dicom_path_column])
     except KeyError:
-        # Check if the column name is case sensitive
+        # First try case-insensitive match
         if dicom_path_column.lower() in [col.lower() for col in row.index]:
-            # Find the actual column name with correct case
             actual_col = next(
                 col for col in row.index if col.lower() == dicom_path_column.lower()
             )
             dicom_path = os.path.join(row[actual_col])
+        # Then try 'DICOM File Path' as a fallback
+        elif "DICOM File Path" in row.index:
+            dicom_path = os.path.join(row["DICOM File Path"])
+        # Finally raise error with available columns
         else:
+            available_cols = sorted(list(row.index))
             raise KeyError(
-                f"Column '{dicom_path_column}' not found in row. Available columns: {list(row.index)}"
+                f"Column '{dicom_path_column}' not found in row and 'DICOM File Path' not found. Available columns: {available_cols}"
             )
 
     output_filename = os.path.basename(dicom_path).replace(".dcm", ".avi")
     output_path = os.path.join(destinationPath, output_filename)
-
-    # Extract H.264 video and get metadata
     _, metadata = extract_h264_video_from_dicom(
         dicom_path, output_path, lossless=lossless, data_type=data_type
     )
-
-    # Convert metadata to serializable format
     serializable_metadata = {k: convert_to_serializable(v) for k, v in metadata.items()}
-
-    # Add file and video_path to metadata if not already present
     if "file" not in serializable_metadata:
         serializable_metadata["file"] = dicom_path
-    if "video_path" not in serializable_metadata:
+    if "video_path" not in serializable_metadata and "error" not in serializable_metadata:
         serializable_metadata["video_path"] = output_path
-
-    # Return a JSON string version
     return json.dumps(serializable_metadata)
 
 
@@ -591,8 +669,6 @@ def main(args=None):
     parser = argparse.ArgumentParser(
         description="Extract H.264 videos and metadata from DICOM or NPZ files."
     )
-
-    # Input arguments
     parser.add_argument("--input_file", required=True, help="Path to the input CSV file")
     parser.add_argument(
         "--file_type",
@@ -620,8 +696,6 @@ def main(args=None):
         "--metadata_dir", required=True, help="Folder for output metadata CSV files"
     )
     parser.add_argument("--subdirectory", help="Column name for subdirectory information")
-
-    # Processing options
     parser.add_argument("--data_type", default="ANGIO", help="Type of DICOM data (e.g., 'ANGIO')")
     parser.add_argument("--fps", type=int, default=30, help="Frames per second for output video")
     parser.add_argument(
@@ -632,9 +706,7 @@ def main(args=None):
     parser.add_argument(
         "--lossless", action="store_true", help="Use lossless compression for video extraction"
     )
-
     args = parser.parse_args(args)
-
     print(f"Processing {args.file_type} files")
     print(f"Input file: {args.input_file}")
     print(f"File path column: {args.file_path_column}")
@@ -668,7 +740,6 @@ def main(args=None):
         print(f"Total files processed: {len(metadata_df)}")
         print(f"Successful conversions: {len(metadata_df[metadata_df['status'] == 'success'])}")
         print(f"Failed conversions: {len(metadata_df[metadata_df['status'] == 'error'])}")
-
     print("Done")
 
 
