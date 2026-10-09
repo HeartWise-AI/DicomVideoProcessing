@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """
 Notebook which iterates through a folder, including subfolders,
-and converts DICOM (and NPZ) files to MP4 videos (or PNG images when single‐frame).
+and converts DICOM files to AVI videos or PNG images, and NPZ files to MP4 videos.
 """
 
 import csv
@@ -232,7 +232,7 @@ def extract_h264_video_from_dicom(
 ):
     """
     Read a DICOM file, process its pixel data according to its Photometric Interpretation,
-    and then save as an MP4 video (if multi-frame) or PNG image (if single-frame).
+    and then save as an FFV1 AVI video (if multi-frame) or PNG image (if single-frame).
     Returns the output file path and serializable metadata.
     """
     import pydicom
@@ -269,6 +269,15 @@ def extract_h264_video_from_dicom(
             frames = [pixel_array]
         else:
             frames = [frame for frame in pixel_array]
+
+    # Keep the angiography cine checks; screenshots and TTE use the paths above.
+    if data_type == "ANGIO" and len(frames) > 1:
+        if (0x08, 0x2144) not in ds:
+            print(f"[WARNING] No frame rate in DICOM: {dicom_path}")
+            return None, {"file_path": dicom_path, "error": "No frame rate in DICOM"}
+        if frame_rate < 5 or frame_rate > len(frames):
+            print(f"[WARNING] Invalid cine frame rate or duration: {dicom_path}")
+            return None, {"file_path": dicom_path, "error": "Frame rate is too low"}
 
     processed_frames = []
     for frame in frames:
@@ -342,53 +351,33 @@ def extract_h264_video_from_dicom(
             proc = cv2.normalize(proc, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
         processed_frames.append(proc)
 
-    # If only one frame (screenshot), save as PNG; otherwise, build video from frames.
+    # If only one frame (screenshot), save as PNG; otherwise, encode lossless AVI.
     if len(processed_frames) == 1:
-        output_file = output_path.replace(".mp4", ".png")
-        cv2.imwrite(output_file, processed_frames[0])
+        output_file = os.path.splitext(output_path)[0] + ".png"
+        if not cv2.imwrite(output_file, processed_frames[0]):
+            return None, {"file_path": dicom_path, "error": "PNG encoding failed"}
     else:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            for i, frm in enumerate(processed_frames):
-                frame_path = os.path.join(temp_dir, f"frame_{i:04d}.png")
-                cv2.imwrite(frame_path, frm)
-            if lossless:
-                ffmpeg_command = [
-                    "ffmpeg",
-                    "-framerate",
-                    str(frame_rate),
-                    "-i",
-                    os.path.join(temp_dir, "frame_%04d.png"),
-                    "-c:v",
-                    "libx264",
-                    "-preset",
-                    "ultrafast",
-                    "-qp",
-                    "0",
-                    "-y",
-                    output_path,
-                ]
-            else:
-                ffmpeg_command = [
-                    "ffmpeg",
-                    "-framerate",
-                    str(frame_rate),
-                    "-i",
-                    os.path.join(temp_dir, "frame_%04d.png"),
-                    "-c:v",
-                    "libx264",
-                    "-crf",
-                    str(crf),
-                    "-preset",
-                    preset,
-                    "-y",
-                    output_path,
-                ]
-            try:
-                subprocess.run(ffmpeg_command, check=True, capture_output=True, text=True)
-            except subprocess.CalledProcessError as e:
-                print(f"FFmpeg command failed: {e.stderr.strip()}")
-                raise
-        output_file = output_path
+        output_file = os.path.splitext(output_path)[0] + ".avi"
+        out = None
+        try:
+            height, width = processed_frames[0].shape[:2]
+            out = cv2.VideoWriter(
+                output_file,
+                cv2.VideoWriter_fourcc(*"FFV1"),
+                frame_rate,
+                (width, height),
+                isColor=processed_frames[0].ndim == 3,
+            )
+            if not out.isOpened():
+                raise RuntimeError("FFV1 video writer could not be opened")
+            for frame in processed_frames:
+                out.write(frame)
+        except Exception as e:
+            print(f"Video encoding failed: {e}")
+            return None, {"file_path": dicom_path, "error": "Video encoding failed"}
+        finally:
+            if out is not None:
+                out.release()
 
     # Convert metadata (excluding large binary fields) to a serializable dict.
     dicom_dict = {}
@@ -560,16 +549,14 @@ def extract_h264_and_metadata(
     subdirectory=None,
     num_processes=None,
     lossless=False,
+    sep="α"
 ):
     from tqdm import tqdm
 
     try:
-        df = pd.read_csv(path, sep="α", engine="python")
-    except pd.errors.EmptyDataError:
-        try:
-            df = pd.read_csv(path, sep=",")
-        except pd.errors.EmptyDataError:
-            df = pd.read_csv(path, sep="μ")
+        df = pd.read_csv(path, sep=sep, engine="python")
+    except pd.errors.EmptyDataError as e:
+        raise ValueError(f"Empty data in {path}") from e
 
     if not os.path.exists(dataFolder):
         os.makedirs(dataFolder)
@@ -591,7 +578,7 @@ def extract_h264_and_metadata(
             process_row,
             [
                 (row, destinationFolder, subdirectory, dicom_path_column, data_type, lossless)
-                for _, row in tqdm(df.iterrows())
+                for _, row in tqdm(df.iterrows(), desc="Preprocessing rows", total=len(df))
             ],
         )
 
@@ -662,7 +649,8 @@ def process_row(
             raise KeyError(
                 f"Column '{dicom_path_column}' not found in row and 'DICOM File Path' not found. Available columns: {available_cols}"
             )
-    output_filename = os.path.basename(dicom_path).replace(".dcm", ".mp4")
+
+    output_filename = os.path.basename(dicom_path).replace(".dcm", ".avi")
     output_path = os.path.join(destinationPath, output_filename)
     _, metadata = extract_h264_video_from_dicom(
         dicom_path, output_path, lossless=lossless, data_type=data_type
@@ -670,7 +658,7 @@ def process_row(
     serializable_metadata = {k: convert_to_serializable(v) for k, v in metadata.items()}
     if "file" not in serializable_metadata:
         serializable_metadata["file"] = dicom_path
-    if "video_path" not in serializable_metadata:
+    if "video_path" not in serializable_metadata and "error" not in serializable_metadata:
         serializable_metadata["video_path"] = output_path
     return json.dumps(serializable_metadata)
 
@@ -694,6 +682,14 @@ def main(args=None):
         help="Column name containing file paths (DICOM or NPZ)",
     )
     parser.add_argument(
+        "--sep",
+        required=False,
+        default="α",
+        help="Separator for the input file (default: α)",
+    )
+
+    # Output arguments
+    parser.add_argument(
         "--output_dir", required=True, help="Destination folder for extracted videos"
     )
     parser.add_argument(
@@ -716,6 +712,8 @@ def main(args=None):
     print(f"File path column: {args.file_path_column}")
     print(f"Output directory: {args.output_dir}")
     print(f"Lossless compression: {args.lossless}")
+    print(f"Separator: {args.sep}")
+
     if args.file_type == "dicom":
         extract_h264_and_metadata(
             args.input_file,
@@ -726,6 +724,7 @@ def main(args=None):
             dataFolder=args.metadata_dir,
             num_processes=args.num_processes,
             lossless=args.lossless,
+            sep=args.sep
         )
     else:  # npz
         df = pd.read_csv(args.input_file)
