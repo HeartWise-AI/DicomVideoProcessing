@@ -21,3 +21,4 @@ df_angle_object_rca_lca_filtered/
 test.py
 CathEF*
 wandb/
+*.bak-*

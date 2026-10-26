@@ -183,6 +183,225 @@ def mask_and_crop(movie):
     return out_movie
 
 
+def create_sector_mask(frames):
+    """
+    Create a mask for the ultrasound scanning sector from a list of BGR frames.
+    Keeps full dimensions, zeros out everything outside the sector.
+    Uses temporal variance + convex hull for robust sector detection.
+    """
+    if len(frames) < 2:
+        # Single frame: threshold-based mask
+        gray = cv2.cvtColor(frames[0], cv2.COLOR_BGR2GRAY) if frames[0].ndim == 3 else frames[0]
+        _, thresh = cv2.threshold(gray, 10, 255, cv2.THRESH_BINARY)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=2)
+        thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=1)
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if contours:
+            largest = max(contours, key=cv2.contourArea)
+            hull = cv2.convexHull(largest)
+            mask = np.zeros(gray.shape, dtype=np.uint8)
+            cv2.fillConvexPoly(mask, hull, 255)
+            return mask
+        return np.ones(gray.shape, dtype=np.uint8) * 255
+
+    # Multi-frame: use temporal difference to find moving (=sector) pixels
+    h, w = frames[0].shape[:2]
+    grays = []
+    for f in frames[:min(len(frames), 30)]:  # use up to 30 frames
+        g = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY) if f.ndim == 3 else f
+        grays.append(g.astype(np.float32))
+
+    # Temporal standard deviation — high inside sector, low outside
+    stack = np.stack(grays, axis=0)
+    temporal_std = np.std(stack, axis=0)
+
+    # Also use mean intensity — sector has non-zero mean
+    temporal_mean = np.mean(stack, axis=0)
+
+    # Combined: pixel is "active" if it has temporal variance OR non-trivial intensity
+    active = ((temporal_std > 2.0) | (temporal_mean > 8.0)).astype(np.uint8) * 255
+
+    # Morphological cleanup
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    active = cv2.morphologyEx(active, cv2.MORPH_CLOSE, kernel, iterations=3)
+    active = cv2.morphologyEx(active, cv2.MORPH_OPEN, kernel, iterations=2)
+
+    # Find largest contour and fill its convex hull
+    contours, _ = cv2.findContours(active, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if contours:
+        largest = max(contours, key=cv2.contourArea)
+        hull = cv2.convexHull(largest)
+        mask = np.zeros((h, w), dtype=np.uint8)
+        cv2.fillConvexPoly(mask, hull, 255)
+        return mask
+
+    return np.ones((h, w), dtype=np.uint8) * 255
+
+
+# --- PHI fix (2026-10): constrain the sector mask to the scanner-declared image regions -------------------
+# create_sector_mask's `temporal_mean > 8` term keeps static burned-in text (header bars with patient name/ID,
+# side text, colour bars); the morphological close + convex hull then merge it into the kept sector.
+# region_constrained_sector_mask ANDs that heuristic with the union of image-type SequenceOfUltrasoundRegions
+# boxes (subtractive only), with a cut-above-sector fallback when no region tags exist.
+# See HeartWise-AI/DeepECHO deid/GOAL.md.
+IMAGE_REGION_TYPES = {1, 2, 3, 4, 5, 6, 7, 8, 9}  # PS3.3 C.8.5.5.1.2 image-data regions (excl. ECG/bars)
+
+
+def _us_regions(ds):
+    regs = []
+    for r in getattr(ds, "SequenceOfUltrasoundRegions", []) or []:
+        try:
+            regs.append(dict(x0=int(r.RegionLocationMinX0), y0=int(r.RegionLocationMinY0),
+                             x1=int(r.RegionLocationMaxX1), y1=int(r.RegionLocationMaxY1),
+                             dtype=int(getattr(r, "RegionDataType", -1))))
+        except Exception:
+            continue
+    return regs
+
+
+def _region_union_mask(regs, H, W):
+    use = [r for r in regs if r["dtype"] in IMAGE_REGION_TYPES]
+    if not use:
+        return None
+    m = np.zeros((H, W), np.uint8)
+    for r in use:
+        x0, y0 = max(0, r["x0"]), max(0, r["y0"])
+        x1, y1 = min(W - 1, r["x1"]), min(H - 1, r["y1"])
+        if x1 > x0 and y1 > y0:
+            m[y0:y1 + 1, x0:x1 + 1] = 255
+    return m if m.any() else None
+
+
+def _gray_stack(frames):
+    return np.stack([(cv2.cvtColor(f, cv2.COLOR_BGR2GRAY) if f.ndim == 3 else f).astype(np.float32)
+                     for f in frames[:30]])
+
+
+def _header_band_rows(frames, max_frac=0.18, cov_thr=0.5):
+    g = _gray_stack(frames)
+    lim = int(max_frac * g.shape[1])
+    static_nonblack = (g.mean(0) > 8) & (g.std(0) <= 2.0)
+    hdr = np.where(static_nonblack[:lim].mean(axis=1) >= cov_thr)[0]
+    return 0 if len(hdr) == 0 else int(hdr.max()) + 3
+
+
+def _std_only_sector_mask(frames):
+    g = _gray_stack(frames)
+    h, w = g.shape[1:]
+    active = (g.std(0) > 2.0).astype(np.uint8) * 255
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    active = cv2.morphologyEx(active, cv2.MORPH_CLOSE, k, iterations=3)
+    active = cv2.morphologyEx(active, cv2.MORPH_OPEN, k, iterations=2)
+    cnts, _ = cv2.findContours(active, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    m = np.zeros((h, w), np.uint8)
+    if cnts:
+        cv2.fillConvexPoly(m, cv2.convexHull(max(cnts, key=cv2.contourArea)), 255)
+    return m
+
+
+def _above_sector_cut(frames, margin=2, max_active_above=0.25):
+    return _above_sector_cut_info(frames, margin, max_active_above)[0]
+
+
+def _above_sector_cut_info(frames, margin=2, max_active_above=0.25):
+    """(cut, multi): multi is True when the cut was raised to the top of all large moving areas."""
+    cut, multi = 0, False
+    if len(frames) > 1:
+        rows = np.where(_std_only_sector_mask(frames).any(axis=1))[0]
+        if len(rows):
+            cut = max(0, int(rows[0]) - margin)
+            # The largest moving area can be a lower panel (Doppler / M-mode strip) below the 2D image; cutting
+            # above it would erase the 2D image. Then cut at the top of all large moving areas instead.
+            active = _gray_stack(frames).std(0) > 2.0
+            if active[:cut].sum() > max_active_above * max(active.sum(), 1):
+                big = np.where(_active_hulls(frames, min_frac=0.02).any(axis=1))[0]
+                if len(big) and int(big[0]) - margin < cut:
+                    cut, multi = max(0, int(big[0]) - margin), True
+        cut = max(cut, _header_band_rows(frames))
+    return cut, multi
+
+
+TOP_BAND_FRAC = 0.18  # no-tag fallback: header text can sit beside the sector apex within the top band
+
+
+def _active_hulls(frames, min_frac=0.002):
+    """Union of convex hulls of every sizeable moving component (keeps all panels, not just the largest)."""
+    g = _gray_stack(frames)
+    h, w = g.shape[1:]
+    active = (g.std(0) > 2.0).astype(np.uint8) * 255
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    active = cv2.morphologyEx(active, cv2.MORPH_CLOSE, k, iterations=3)
+    active = cv2.morphologyEx(active, cv2.MORPH_OPEN, k, iterations=2)
+    cnts, _ = cv2.findContours(active, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    m = np.zeros((h, w), np.uint8)
+    for c in cnts:
+        if cv2.contourArea(c) >= min_frac * h * w:
+            cv2.fillConvexPoly(m, cv2.convexHull(c), 255)
+    return m
+
+
+def _static_text_mask(frames):
+    g = _gray_stack(frames)
+    mu, sd = g.mean(0), g.std(0)
+    text = (((mu > 8) & (sd <= 2.0)) | ((mu > 120) & (sd <= 12.0))).astype(np.uint8)
+    return cv2.dilate(text, np.ones((3, 3), np.uint8)).astype(bool)
+
+
+def _undeclared_moving_panels(frames, heur, R, regs, min_panel_frac=0.02, min_add_frac=0.01):
+    """Large moving areas outside the declared regions but below their top (e.g. a 3D render), or None."""
+    if len(frames) < 2:
+        return None
+    H, W = R.shape
+    big = _active_hulls(frames, min_frac=min_panel_frac)
+    if not big.any():
+        return None
+    top = min(r["y0"] for r in regs if r["dtype"] in IMAGE_REGION_TYPES)
+    extra = cv2.bitwise_and(heur, big)
+    extra[:max(0, top)] = 0
+    extra[R > 0] = 0
+    extra[_static_text_mask(frames)] = 0
+    return extra if (extra > 0).sum() >= min_add_frac * H * W else None
+
+
+def region_constrained_sector_mask(frames, ds):
+    """Returns (mask uint8 {0,255}, method). Never keeps a pixel the original heuristic dropped."""
+    H, W = frames[0].shape[:2]
+    R = _region_union_mask(_us_regions(ds), H, W)
+    heur = create_sector_mask(frames)
+    if R is not None:
+        m = cv2.bitwise_and(heur, R)
+        method = "heuristic_and_region"
+        if m.sum() < 0.05 * R.sum():  # heuristic collapsed -> trust the scanner's box
+            m, method = R.copy(), "region_union"
+        # 3D TEE screens: the scanner declares only the 2D panels, not the large 3D render. Keep big moving
+        # areas below the top of the image regions as well, minus static/bright-static (text) pixels.
+        extra = _undeclared_moving_panels(frames, heur, R, _us_regions(ds))
+        if extra is not None:
+            m, method = cv2.bitwise_or(m, extra), method + "+moving"
+        return m, method
+    m = heur.copy()
+    cut, multi = _above_sector_cut_info(frames)
+    if cut:
+        m[:cut] = 0
+    tag = "multi" if multi else ""
+    hulls = _active_hulls(frames) if len(frames) > 1 else None
+    if hulls is None or not hulls.any():
+        return m, f"fallback_{tag}cut{cut}"
+    # Top band: keep only moving regions, and drop static non-black pixels (burned-in text) even inside them.
+    hulls = cv2.dilate(hulls, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)))
+    top = int(TOP_BAND_FRAC * H)
+    m[:top] = cv2.bitwise_and(m[:top], hulls[:top])
+    g = _gray_stack(frames)
+    # static non-black pixels, plus bright near-static ones (text over moving speckle flickers with JPEG noise)
+    mu, sd = g.mean(0), g.std(0)
+    static_text = (((mu > 8) & (sd <= 2.0)) | ((mu > 120) & (sd <= 12.0))).astype(np.uint8)
+    static_text = cv2.dilate(static_text, np.ones((3, 3), np.uint8)).astype(bool)
+    band = m[:top]
+    band[static_text[:top]] = 0
+    return m, f"fallback_{tag}cuthull{cut}"
+
+
 def process_metadata(metadata, data_type):
     tag_map = DICOM_DICT[data_type]
 
@@ -256,6 +475,21 @@ def extract_h264_video_from_dicom(
 
     # Get photometric interpretation (defaulting to MONOCHROME2)
     photo_type = getattr(ds, "PhotometricInterpretation", "MONOCHROME2")
+
+    # Fix YBR_FULL_422 mis-labeling: if pixel data is 3 bytes/pixel (not 2),
+    # the data is actually RGB/YBR_FULL, not 4:2:2 subsampled.
+    if photo_type == "YBR_FULL_422" and hasattr(ds, "PixelData"):
+        rows = int(getattr(ds, "Rows", 0))
+        cols = int(getattr(ds, "Columns", 0))
+        nframes = int(getattr(ds, "NumberOfFrames", 1))
+        samples = int(getattr(ds, "SamplesPerPixel", 1))
+        bits = int(getattr(ds, "BitsAllocated", 8))
+        expected_422 = rows * cols * nframes * 2 * (bits // 8)  # YBR_FULL_422: 2 bytes/pixel
+        actual_len = len(ds.PixelData)
+        if actual_len > expected_422 * 1.2:
+            ds.PhotometricInterpretation = "YBR_FULL"
+            photo_type = "YBR_FULL"
+
     pixel_array = ds.pixel_array
 
     # Determine if the image is multi-frame:
@@ -342,6 +576,15 @@ def extract_h264_video_from_dicom(
             proc = cv2.normalize(proc, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
         processed_frames.append(proc)
 
+    # Mask pixels outside the ultrasound scanning sector, constrained to the scanner-declared image regions.
+    # FAIL CLOSED: any masking error propagates (caller records the error, nothing is written) - an
+    # unmasked frame can carry burned-in patient identifiers.
+    sector_mask, mask_method = region_constrained_sector_mask(processed_frames, ds)
+    for i in range(len(processed_frames)):
+        processed_frames[i] = cv2.bitwise_and(
+            processed_frames[i], processed_frames[i], mask=sector_mask
+        )
+
     # If only one frame (screenshot), save as PNG; otherwise, build video from frames.
     if len(processed_frames) == 1:
         output_file = output_path.replace(".mp4", ".png")
@@ -398,6 +641,8 @@ def extract_h264_video_from_dicom(
             if tag_str not in ["(5000, 3000)", "(7fe0, 0010)"]:
                 dicom_dict[elem.keyword] = convert_to_serializable(elem.value)
     dicom_dict["video_path"] = output_file
+    dicom_dict["mask_method"] = mask_method
+    dicom_dict["mask_kept_frac"] = float((sector_mask > 0).mean())
     return output_file, dicom_dict
 
 
@@ -610,9 +855,17 @@ def extract_h264_and_metadata(
         format_time_column(dicom_df_final, "StudyTime")
 
     if existing_df is not None:
-        # Combine existing and new data, keeping last occurrence of duplicates
+        # Combine existing and new data, keeping last occurrence of duplicates.
+        # ANGIO uses "FileName"; TTE keeps "video_path"; "dicom_path" works for both.
         combined_df = pd.concat([existing_df, dicom_df_final])
-        dicom_df_final = combined_df.drop_duplicates(subset=["FileName"], keep="last")
+        dedupe_col = next(
+            (c for c in ("FileName", "video_path", "dicom_path") if c in combined_df.columns),
+            None,
+        )
+        if dedupe_col is not None:
+            dicom_df_final = combined_df.drop_duplicates(subset=[dedupe_col], keep="last")
+        else:
+            dicom_df_final = combined_df
 
     dicom_df_final.to_csv(final_path, index=False)
     print(f"Metadata saved to: {final_path}")
@@ -662,17 +915,32 @@ def process_row(
             raise KeyError(
                 f"Column '{dicom_path_column}' not found in row and 'DICOM File Path' not found. Available columns: {available_cols}"
             )
+    # Preserve PatientID/StudyInstanceUID directory structure from DICOM path
+    # so each DICOM produces a uniquely-named output file.
+    # Expected DICOM path: .../PatientID/StudyInstanceUID/InstanceNumber.dcm
+    dicom_parts = os.path.normpath(dicom_path).split(os.sep)
+    if len(dicom_parts) >= 3:
+        patient_id = dicom_parts[-3]
+        study_uid = dicom_parts[-2]
+        sub_out = os.path.join(destinationPath, patient_id, study_uid)
+    else:
+        sub_out = destinationPath
+    os.makedirs(sub_out, exist_ok=True)
     output_filename = os.path.basename(dicom_path).replace(".dcm", ".mp4")
-    output_path = os.path.join(destinationPath, output_filename)
-    _, metadata = extract_h264_video_from_dicom(
-        dicom_path, output_path, lossless=lossless, data_type=data_type
-    )
-    serializable_metadata = {k: convert_to_serializable(v) for k, v in metadata.items()}
-    if "file" not in serializable_metadata:
-        serializable_metadata["file"] = dicom_path
-    if "video_path" not in serializable_metadata:
-        serializable_metadata["video_path"] = output_path
-    return json.dumps(serializable_metadata)
+    output_path = os.path.join(sub_out, output_filename)
+    try:
+        _, metadata = extract_h264_video_from_dicom(
+            dicom_path, output_path, lossless=lossless, data_type=data_type
+        )
+        serializable_metadata = {k: convert_to_serializable(v) for k, v in metadata.items()}
+        if "file" not in serializable_metadata:
+            serializable_metadata["file"] = dicom_path
+        if "video_path" not in serializable_metadata:
+            serializable_metadata["video_path"] = output_path
+        return json.dumps(serializable_metadata)
+    except Exception as e:
+        print(f"Error processing {dicom_path}: {e}")
+        return None
 
 
 def main(args=None):
